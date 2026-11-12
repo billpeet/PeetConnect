@@ -65,6 +65,9 @@ pub struct RemoteShared {
     pub generation: AtomicU64,
     /// Clipboard text the host pushed, waiting for the UI thread to write locally.
     pub clipboard_in: Mutex<Option<String>>,
+    /// Set once the network thread has fully stopped (decoder released), so the UI may start
+    /// another session against the same window.
+    pub finished: AtomicBool,
 }
 
 impl RemoteShared {
@@ -186,6 +189,7 @@ async fn session_loop(
     frames: mpsc::Sender<VideoFrame>,
 ) -> Result<()> {
     let mut attempt: u32 = 0;
+    let mut ever_connected = false;
     loop {
         if shared.quit.load(Ordering::Relaxed) {
             return Ok(());
@@ -194,12 +198,18 @@ async fn session_loop(
         match session(&config, shared, frames.clone()).await {
             Ok(SessionEnd::Quit) => return Ok(()),
             Ok(SessionEnd::Lost(reason)) => {
+                ever_connected = true;
                 attempt = 0;
                 tracing::info!(%reason, "connection lost; reconnecting");
             }
             Err(err) => {
-                if let Some(peet_core::ConnectError::Rejected(_)) =
-                    err.downcast_ref::<peet_core::ConnectError>()
+                // Only a session that once worked is worth retrying: a host that never
+                // answered, or one that rejected us, is reported straight back to the user.
+                if !ever_connected
+                    || matches!(
+                        err.downcast_ref::<peet_core::ConnectError>(),
+                        Some(peet_core::ConnectError::Rejected(_))
+                    )
                 {
                     return Err(err);
                 }

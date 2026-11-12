@@ -20,7 +20,7 @@ Status: early development. See [docs/PLAN.md](docs/PLAN.md) for architecture and
 | `bins/peet` | Command line, and the `mcp` subcommand: an MCP server exposing hosts as agent tools. |
 | `bins/peet-bench` | Capture and encode benchmarks. |
 | `bins/peet-host` | Host: serves monitors to authorised tailnet viewers; injects input; runs as a console process or a LocalSystem service. |
-| `bins/peet-viewer` | GPUI viewer: `--connect <host>` for a remote session, or a loopback test rig. |
+| `bins/peet-viewer` | GPUI viewer: home screen with tailnet devices, favourites and recents; `--connect <host>` for a direct session; `--loopback` test rig. |
 
 ## Try it
 
@@ -41,9 +41,9 @@ cargo run --release -p peet-bench -- capture --seconds 5   # writes bench-out/mo
 The benchmark opens animated windows on each monitor so the capturer always has motion.
 
 ```
-cargo run --release -p peet-viewer -- --present d3d            # loopback mirror of the primary monitor
-cargo run --release -p peet-viewer -- --present d3d --upscale 3840x2160 --bitrate-kbps 30000
-cargo run --release -p peet-viewer -- --present gpui           # the rejected image-element path, for comparison
+cargo run --release -p peet-viewer -- --loopback --present d3d    # loopback mirror of the primary monitor
+cargo run --release -p peet-viewer -- --loopback --present d3d --upscale 3840x2160 --bitrate-kbps 30000
+cargo run --release -p peet-viewer -- --loopback --present gpui   # the rejected image-element path, for comparison
 ```
 
 Stage timings print to stderr every two seconds.
@@ -65,14 +65,24 @@ settings. Allow `peet-host.exe` through Windows Firewall when prompted.
 On the viewing machine:
 
 ```
+cargo run --release -p peet-viewer                                  # home screen
 cargo run --release -p peet-viewer -- --connect <magicdns-name-or-100.x.y.z>
 cargo run --release -p peet -- monitors <host>                      # headless: list monitors
 cargo run --release -p peet -- screenshot <host> -o shot.png        # headless: PNG still
 ```
 
-The viewer forwards mouse and keyboard to the host. `Ctrl+Alt+1`..`9` switch monitors locally;
-every other key reaches the remote machine. The host injects input with `SendInput` and so
-drives whatever has focus in the interactive session.
+The home screen lists the devices on your tailnet (live, with online state), your favourites
+(star a row) and recent connections; click a row or type an address and press Enter. Those
+and the default fps/bitrate persist in `%APPDATA%\PeetConnectiewer.toml`. Hosts that need a
+PIN are reached with `--connect <host> --pin <pin>` for now.
+
+In a session the viewer forwards mouse and keyboard to the host. `Ctrl+Alt+1`..`9` switch
+monitors locally, `Ctrl+Alt+D` (or the status-bar button) disconnects back to the home
+screen; every other key reaches the remote machine. The host injects input with `SendInput`
+and so drives whatever has focus in the interactive session. The clipboard syncs both ways
+(text only): copy on either side and paste on the other. If the connection drops, the viewer
+reconnects on its own with backoff and returns to the monitor you were watching; a host that
+never answered is reported back on the home screen instead.
 
 The CLI drives input headlessly, which is how an agent clicks and types without a window:
 

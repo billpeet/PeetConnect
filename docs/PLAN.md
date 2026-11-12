@@ -204,8 +204,32 @@ Enter; agents send `peet_key enter` for a line break (same semantics as M4 text 
 
 Exit met: an agent can drive a remote session with no GUI.
 
-**M6 — Daily-driver UX.** Multi-monitor layout, clipboard, file transfer, connection list with
-favourites, tray app, settings, reconnect. Exit: replaces AnyDesk for personal use.
+**M6 — Daily-driver UX.** (in progress)
+
+Done: *Reconnect* — the viewer runs sessions back to back with 1/2/4/8/10 s backoff after a
+session that once worked is lost; the decode thread survives and resets on a per-connection
+generation; the chosen monitor is restored; a host that never answered or rejected us goes
+straight back to the home screen with the error. QUIC idle timeout is 6 s (keep-alive 2 s) so a
+dead host is noticed quickly. *Clipboard sync* (text) — the host watches the clipboard sequence
+number and pushes changes as an unsolicited `ClipboardText`; the viewer writes them locally and
+pushes its own changes while active; one last-seen value guards both directions against echo.
+*Home screen* — live tailnet device list (3 s refresh via LocalAPI), favourites (star toggle),
+recents, an address box, click-to-connect; `Ctrl+Alt+D` or a status-bar button disconnects back
+to it. Settings persist in `%APPDATA%\PeetConnectiewer.toml` (fps, bitrate, favourites,
+recents). `--loopback` now selects the M2 test rig; no arguments opens the home screen.
+
+Verified on the dev box's own Tailscale IP: kill-and-restart of the host reconnected in ~11 s with
+a rebuilt decoder; a host-side clipboard change arrived at the viewer; the home screen was driven
+end to end by injected input (click the address box, scancode-type the IP, Enter → 60 fps session,
+`Ctrl+Alt+D` → home with the new recent). Finding: GPUI ignores `VK_PACKET` key events, so
+`peet type` cannot type into a GPUI window (use `peet key` scancodes); physical keyboards are
+unaffected. Injected clicks do activate the GPUI window, which lifts the old "cannot focus the
+viewer from automation" limit for keyboard testing.
+
+Not done: multi-monitor layout (all monitors at once as extra composition visuals), file
+transfer, host tray app, a settings UI (values are file-only), PIN entry on the home screen.
+Exit — replaces AnyDesk for personal use — needs at least the multi-monitor layout and a second
+real machine.
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer, signing + auto-update, distribution.

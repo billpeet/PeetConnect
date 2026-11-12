@@ -1,8 +1,9 @@
 //! `peet-viewer`: the PeetConnect desktop viewer.
 //!
-//! `--connect <host>` views a remote PeetConnect host over Tailscale. Without it the viewer
-//! runs the milestone 2 loopback rig (local capture, encode, decode and present) which is
-//! still the quickest way to measure the pipeline on one machine.
+//! With no arguments it opens the home screen: tailnet devices, favourites and recent
+//! connections; click one (or type an address) to connect. `--connect <host>` skips straight
+//! to a session. `--loopback` runs the milestone 2 rig (local capture, encode, decode and
+//! present), still the quickest way to measure the pipeline on one machine.
 
 use clap::{Parser, ValueEnum};
 
@@ -18,18 +19,21 @@ struct Cli {
     /// Monitor ID to show or capture; default is the primary.
     #[arg(long)]
     monitor: Option<u32>,
+    /// Run the local loopback rig instead of a remote session.
+    #[arg(long)]
+    loopback: bool,
     /// Loopback only: how video reaches the screen.
     #[arg(long, value_enum, default_value_t = PresentMode::D3d)]
     present: PresentMode,
     /// Loopback only: capture backend.
     #[arg(long, value_enum, default_value_t = CaptureBackend::Auto)]
     capture: CaptureBackend,
-    /// Frame rate to request.
-    #[arg(long, default_value_t = 60)]
-    fps: u32,
-    /// Bitrate to request, kbit/s.
-    #[arg(long, default_value_t = 12000)]
-    bitrate_kbps: u32,
+    /// Frame rate to request. Default: the saved setting (60).
+    #[arg(long)]
+    fps: Option<u32>,
+    /// Bitrate to request, kbit/s. Default: the saved setting (12000).
+    #[arg(long)]
+    bitrate_kbps: Option<u32>,
     /// Loopback only: scale the captured desktop to this size before encoding, e.g. `3840x2160`.
     #[arg(long)]
     upscale: Option<String>,
@@ -76,6 +80,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
+mod home;
+#[cfg(windows)]
 mod pipeline;
 #[cfg(windows)]
 mod present;
@@ -84,6 +90,7 @@ mod remote;
 
 #[cfg(windows)]
 mod app {
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc::{channel, sync_channel, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -91,15 +98,16 @@ mod app {
     use anyhow::{Context as _, Result};
     use gpui::{
         canvas, div, img, prelude::*, px, rgb, size, App, Application, Bounds, ClipboardItem,
-        Context, FocusHandle, ImageSource, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-        MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, Pixels, Point, RenderImage,
-        ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window, WindowBackgroundAppearance,
-        WindowBounds, WindowOptions,
+        Context, FocusHandle, FontWeight, ImageSource, KeyDownEvent, Keystroke, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, Pixels,
+        Point, RenderImage, ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window,
+        WindowBackgroundAppearance, WindowBounds, WindowOptions,
     };
     use peet_capture::windows::Backend;
     use peet_proto::MonitorId;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+    use crate::home::{self, Discovery, ViewerConfig};
     use crate::pipeline::{self, Output, UiFrame};
     use crate::present::{Placement, SharedPlacement};
     use crate::remote::{self, RemoteShared};
@@ -111,7 +119,7 @@ mod app {
         LoopbackImage,
         /// Loopback rig drawing through DirectComposition.
         LoopbackD3d,
-        /// Remote session drawing through DirectComposition.
+        /// Remote sessions drawing through DirectComposition, with the home screen between.
         Remote,
     }
 
@@ -121,44 +129,43 @@ mod app {
         }
     }
 
+    /// What the window shows in `Mode::Remote`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Screen {
+        Home,
+        Session,
+    }
+
+    /// Settings a session is started with.
+    #[derive(Debug, Clone)]
+    struct SessionDefaults {
+        pin: Option<String>,
+        monitor: Option<u32>,
+        fps: u32,
+        bitrate_kbps: u32,
+        vsync: bool,
+    }
+
     pub fn run(cli: &Cli) -> Result<()> {
         let (ui_tx, ui_rx) = sync_channel::<UiFrame>(2);
         let (win_tx, win_rx) = channel::<isize>();
         let placement: SharedPlacement = Arc::new(Mutex::new(Placement::default()));
-        let shared = Arc::new(RemoteShared::default());
+        let config = ViewerConfig::load();
 
-        let mode = match (&cli.connect, cli.present) {
-            (Some(_), _) => Mode::Remote,
-            (None, PresentMode::Gpui) => Mode::LoopbackImage,
-            (None, PresentMode::D3d) => Mode::LoopbackD3d,
+        let mode = match (cli.loopback, cli.present) {
+            (false, _) => Mode::Remote,
+            (true, PresentMode::Gpui) => Mode::LoopbackImage,
+            (true, PresentMode::D3d) => Mode::LoopbackD3d,
+        };
+        let defaults = SessionDefaults {
+            pin: cli.pin.clone(),
+            monitor: cli.monitor,
+            fps: cli.fps.unwrap_or(config.fps),
+            bitrate_kbps: cli.bitrate_kbps.unwrap_or(config.bitrate_kbps),
+            vsync: !cli.no_vsync,
         };
 
-        if let Some(target) = &cli.connect {
-            let config = remote::Config {
-                session: remote::SessionConfig {
-                    target: target.clone(),
-                    pin: cli.pin.clone(),
-                    monitor: cli.monitor,
-                    fps: cli.fps,
-                    bitrate_kbps: cli.bitrate_kbps,
-                },
-                window: win_rx,
-                placement: placement.clone(),
-                vsync: !cli.no_vsync,
-                shared: shared.clone(),
-            };
-            let shared_for_thread = shared.clone();
-            std::thread::Builder::new()
-                .name("network".into())
-                .spawn(move || {
-                    if let Err(err) = remote::run(config) {
-                        tracing::error!(%err, "session failed");
-                        let mut status = shared_for_thread.status.lock().expect("status poisoned");
-                        status.connected = false;
-                        status.message = format!("{err:#}");
-                    }
-                })?;
-        } else {
+        if mode != Mode::Remote {
             let upscale = cli
                 .upscale
                 .as_deref()
@@ -184,8 +191,8 @@ mod app {
                     CaptureBackend::Dxgi => Backend::Dxgi,
                     CaptureBackend::Gdi => Backend::Gdi,
                 },
-                fps: cli.fps,
-                bitrate_kbps: cli.bitrate_kbps,
+                fps: defaults.fps,
+                bitrate_kbps: defaults.bitrate_kbps,
                 upscale,
                 hardware_only: cli.hardware_only,
                 output,
@@ -200,16 +207,16 @@ mod app {
                 })?;
         }
 
-        let title = match &cli.connect {
-            Some(target) => format!("PeetConnect - {target}"),
-            None => "PeetConnect viewer (loopback)".to_string(),
+        let title = if mode == Mode::Remote {
+            "PeetConnect".to_string()
+        } else {
+            "PeetConnect viewer (loopback)".to_string()
         };
-        let shared_for_close = shared.clone();
+        let initial_target = cli.connect.clone();
         Application::new().run(move |cx: &mut App| {
-            // Closing the last window ends the session (no reconnect) and exits.
-            cx.on_window_closed(move |cx| {
+            // Closing the last window exits; the viewer's drop ends any session.
+            cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
-                    shared_for_close.quit();
                     cx.quit();
                 }
             })
@@ -230,7 +237,20 @@ mod app {
                     },
                     ..Default::default()
                 },
-                |_, cx| cx.new(|cx| Viewer::new(mode, ui_rx, win_tx, placement, shared, cx)),
+                |_, cx| {
+                    cx.new(|cx| {
+                        Viewer::new(
+                            mode,
+                            ui_rx,
+                            win_tx,
+                            placement,
+                            config,
+                            defaults,
+                            initial_target,
+                            cx,
+                        )
+                    })
+                },
             )
             .expect("open window");
             cx.activate(true);
@@ -240,10 +260,22 @@ mod app {
 
     struct Viewer {
         mode: Mode,
+        screen: Screen,
         rx: Receiver<UiFrame>,
+        /// Loopback only: hands the window handle to the pipeline thread once.
         win_tx: Option<Sender<isize>>,
+        hwnd: Option<isize>,
         placement: SharedPlacement,
         shared: Arc<RemoteShared>,
+        config: ViewerConfig,
+        defaults: SessionDefaults,
+        discovery: Arc<Mutex<Discovery>>,
+        /// Address typed on the home screen.
+        address: String,
+        /// Last session's failure, shown on the home screen.
+        last_error: Option<String>,
+        /// A connect requested before the window handle was known: (target, display name).
+        pending: Option<(String, String)>,
         focus: FocusHandle,
         focused_once: bool,
         image: Option<Arc<RenderImage>>,
@@ -260,20 +292,32 @@ mod app {
     }
 
     impl Viewer {
+        #[allow(clippy::too_many_arguments)]
         fn new(
             mode: Mode,
             rx: Receiver<UiFrame>,
             win_tx: Sender<isize>,
             placement: SharedPlacement,
-            shared: Arc<RemoteShared>,
+            config: ViewerConfig,
+            defaults: SessionDefaults,
+            initial_target: Option<String>,
             cx: &mut Context<Self>,
         ) -> Self {
+            let pending = initial_target.map(|t| (t.clone(), t));
             Self {
                 mode,
+                screen: Screen::Home,
                 rx,
                 win_tx: Some(win_tx),
+                hwnd: None,
                 placement,
-                shared,
+                shared: Arc::new(RemoteShared::default()),
+                config,
+                defaults,
+                discovery: home::start_discovery(),
+                address: String::new(),
+                last_error: None,
+                pending,
                 focus: cx.focus_handle(),
                 focused_once: false,
                 image: None,
@@ -287,6 +331,74 @@ mod app {
                 last_clipboard: None,
                 clipboard_checked: Instant::now(),
             }
+        }
+
+        /// Starts a session against `target`, or queues it until the window handle is known.
+        fn connect(&mut self, target: String, name: String) {
+            let Some(hwnd) = self.hwnd else {
+                self.pending = Some((target, name));
+                return;
+            };
+            let target = target.trim().to_string();
+            if target.is_empty() {
+                return;
+            }
+            let (win_tx, win_rx) = channel::<isize>();
+            let _ = win_tx.send(hwnd);
+            let shared = Arc::new(RemoteShared::default());
+            self.shared = shared.clone();
+            self.last_error = None;
+            self.last_clipboard = None;
+            self.config.record_recent(&target, &name);
+            self.screen = Screen::Session;
+            self.status = "connecting".into();
+            let config = remote::Config {
+                session: remote::SessionConfig {
+                    target,
+                    pin: self.defaults.pin.clone(),
+                    monitor: self.defaults.monitor,
+                    fps: self.defaults.fps,
+                    bitrate_kbps: self.defaults.bitrate_kbps,
+                },
+                window: win_rx,
+                placement: self.placement.clone(),
+                vsync: self.defaults.vsync,
+                shared: shared.clone(),
+            };
+            let spawned = std::thread::Builder::new()
+                .name("network".into())
+                .spawn(move || {
+                    if let Err(err) = remote::run(config) {
+                        tracing::error!(%err, "session failed");
+                        let mut status = shared.status.lock().expect("status poisoned");
+                        status.connected = false;
+                        status.message = format!("{err:#}");
+                    }
+                    shared.finished.store(true, Ordering::Relaxed);
+                });
+            if let Err(err) = spawned {
+                self.last_error = Some(format!("could not start session: {err}"));
+                self.screen = Screen::Home;
+            }
+        }
+
+        /// Asks the session to end; the screen flips to Home once the thread has stopped.
+        fn disconnect(&mut self) {
+            self.shared.quit();
+        }
+
+        /// Flips back to the home screen once a session thread has fully stopped (and with it
+        /// the presenter, so a new session can attach to the window).
+        fn poll_session_end(&mut self) {
+            if self.screen != Screen::Session || !self.shared.finished.load(Ordering::Relaxed) {
+                return;
+            }
+            let status = self.shared.status();
+            if status.message != "disconnected" && !status.message.is_empty() {
+                self.last_error = Some(status.message);
+            }
+            self.screen = Screen::Home;
+            self.status = String::new();
         }
 
         /// Two-way clipboard sync. Text the host pushed is written locally; local changes
@@ -379,7 +491,7 @@ mod app {
                             String::new()
                         };
                         format!(
-                            "{}  |  {monitor}  |  {}x{}  |  {:.0} fps (host {})  |  {} kbit/s  |  decode {:.2} ms{rtt}{skipped}  |  ctrl+alt+1-{} switch monitor",
+                            "{}  |  {monitor}  |  {}x{}  |  {:.0} fps (host {})  |  {} kbit/s  |  decode {:.2} ms{rtt}{skipped}  |  ctrl+alt+1-{} monitor, ctrl+alt+d disconnect",
                             s.host_name,
                             s.frame_size.0,
                             s.frame_size.1,
@@ -403,31 +515,45 @@ mod app {
             self.since = Instant::now();
         }
 
-        /// Hands the native window handle to the video thread once, so it can attach its
-        /// composition target.
+        /// Learns the native window handle once. Loopback hands it straight to the pipeline
+        /// thread; remote sessions get it when they start.
         fn publish_window_handle(&mut self, window: &Window) {
-            let Some(tx) = self.win_tx.take() else {
+            if self.hwnd.is_some() {
                 return;
-            };
+            }
             let Ok(handle) = HasWindowHandle::window_handle(window) else {
-                self.win_tx = Some(tx);
                 return;
             };
             if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                let _ = tx.send(win32.hwnd.get());
+                let hwnd = win32.hwnd.get();
+                self.hwnd = Some(hwnd);
+                if self.mode != Mode::Remote {
+                    if let Some(tx) = self.win_tx.take() {
+                        let _ = tx.send(hwnd);
+                    }
+                }
             }
         }
 
-        fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, _cx: &mut Context<Self>) {
+        fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
             if self.mode != Mode::Remote {
                 return;
             }
             window.focus(&self.focus);
             let ks = &event.keystroke;
             let m = ks.modifiers;
+            tracing::trace!(key = %ks.key, ?m, screen = ?self.screen, "key down");
+            if self.screen == Screen::Home {
+                self.on_home_key(ks, cx);
+                return;
+            }
             // Ctrl+Alt+<digit> switches the monitor locally instead of reaching the host, so
-            // bare digits still type normally on the remote machine.
+            // bare digits still type normally on the remote machine. Ctrl+Alt+D disconnects.
             if m.control && m.alt {
+                if ks.key == "d" {
+                    self.disconnect();
+                    return;
+                }
                 if let Some(index) = ks
                     .key
                     .parse::<usize>()
@@ -443,6 +569,42 @@ mod app {
                 }
             }
             self.forward_key(ks);
+        }
+
+        /// The home screen's only text field: the address box.
+        fn on_home_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+            let m = ks.modifiers;
+            match ks.key.as_str() {
+                "enter" => {
+                    let target = self.address.trim().to_string();
+                    if !target.is_empty() {
+                        self.connect(target.clone(), target);
+                    }
+                }
+                "backspace" => {
+                    if m.control {
+                        self.address.clear();
+                    } else {
+                        self.address.pop();
+                    }
+                }
+                "escape" => self.address.clear(),
+                "v" if m.control => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                        self.address.push_str(text.trim());
+                    }
+                }
+                _ => {
+                    if !m.control && !m.alt && !m.platform {
+                        if let Some(ch) = &ks.key_char {
+                            if !ch.chars().any(char::is_control) {
+                                self.address.push_str(ch);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
         }
 
         /// Sends a keystroke to the host as scancodes, wrapping the key in whatever modifiers
@@ -646,6 +808,229 @@ mod app {
                     .into_any_element(),
             )
         }
+
+        // ---- home screen -----------------------------------------------------------------
+
+        /// One clickable host row with a favourite toggle.
+        fn host_row(
+            &self,
+            id: (&'static str, usize),
+            target: &str,
+            name: String,
+            detail: String,
+            online: Option<bool>,
+            cx: &mut Context<Self>,
+        ) -> gpui::AnyElement {
+            let fav = self.config.is_favourite(target);
+            let (t1, n1) = (target.to_string(), name.clone());
+            let (t2, n2) = (target.to_string(), name.clone());
+            let text = if online == Some(false) {
+                0x777777
+            } else {
+                0xe6e6e6
+            };
+            let dot = match online {
+                Some(true) => 0x3dd68c,
+                Some(false) => 0x444a55,
+                None => 0x5c6b85,
+            };
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x2a2f3a)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.connect(t1.clone(), n1.clone());
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id((id.0, id.1 + 10_000))
+                        .w(px(22.0))
+                        .text_center()
+                        .cursor_pointer()
+                        .text_color(rgb(if fav { 0xffc53d } else { 0x555b66 }))
+                        .hover(|s| s.text_color(rgb(0xffc53d)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.config.toggle_favourite(&t2, &n2);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .child(if fav { "★" } else { "☆" }),
+                )
+                .child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(rgb(dot)))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_color(rgb(text)).child(name))
+                        .child(div().text_xs().text_color(rgb(0x8a909c)).child(detail)),
+                )
+                .into_any_element()
+        }
+
+        fn section(title: &'static str) -> gpui::Div {
+            div()
+                .mt_4()
+                .mb_1()
+                .px_3()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(0x8a909c))
+                .child(title)
+        }
+
+        fn render_home(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+            let (peers, disc_error, loaded) = self
+                .discovery
+                .lock()
+                .map(|d| (d.peers.clone(), d.error.clone(), d.ever_loaded))
+                .unwrap_or_default();
+            let fav_rows: Vec<_> = self
+                .config
+                .favourites
+                .clone()
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let online = peers
+                        .iter()
+                        .find(|p| p.target == s.target)
+                        .map(|p| p.online);
+                    self.host_row(("fav", i), &s.target, s.name, s.target.clone(), online, cx)
+                })
+                .collect();
+            let recent_rows: Vec<_> = self
+                .config
+                .recents
+                .clone()
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let online = peers
+                        .iter()
+                        .find(|p| p.target == s.target)
+                        .map(|p| p.online);
+                    self.host_row(
+                        ("recent", i),
+                        &s.target,
+                        s.name,
+                        s.target.clone(),
+                        online,
+                        cx,
+                    )
+                })
+                .collect();
+            let peer_rows: Vec<_> = peers
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let detail = format!(
+                        "{}  ·  {}  ·  {}",
+                        p.dns_name,
+                        p.target,
+                        if p.online { &p.os } else { "offline" }
+                    );
+                    self.host_row(
+                        ("peer", i),
+                        &p.target,
+                        p.name.clone(),
+                        detail,
+                        Some(p.online),
+                        cx,
+                    )
+                })
+                .collect();
+
+            let address = if self.address.is_empty() {
+                div()
+                    .text_color(rgb(0x6a7080))
+                    .child("type a MagicDNS name or Tailscale IP, then Enter")
+            } else {
+                div()
+                    .text_color(rgb(0xf0f0f0))
+                    .child(format!("{}▏", self.address))
+            };
+            let mut column = div()
+                .flex()
+                .flex_col()
+                .w(px(640.0))
+                .max_w_full()
+                .child(
+                    div()
+                        .mb_3()
+                        .text_xl()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xf0f0f0))
+                        .child("PeetConnect"),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(0x1c2028))
+                        .border_1()
+                        .border_color(rgb(0x343a46))
+                        .child(address),
+                );
+            if let Some(err) = &self.last_error {
+                column = column.child(
+                    div()
+                        .mt_2()
+                        .px_3()
+                        .text_sm()
+                        .text_color(rgb(0xff7b72))
+                        .child(err.clone()),
+                );
+            }
+            if !fav_rows.is_empty() {
+                column = column.child(Self::section("FAVOURITES")).children(fav_rows);
+            }
+            if !recent_rows.is_empty() {
+                column = column.child(Self::section("RECENT")).children(recent_rows);
+            }
+            column = column.child(Self::section("TAILNET"));
+            if let Some(err) = disc_error {
+                column = column.child(div().px_3().text_sm().text_color(rgb(0xff7b72)).child(err));
+            } else if !loaded {
+                column = column.child(
+                    div()
+                        .px_3()
+                        .text_sm()
+                        .text_color(rgb(0x8a909c))
+                        .child("looking for devices"),
+                );
+            } else if peer_rows.is_empty() {
+                column = column.child(
+                    div()
+                        .px_3()
+                        .text_sm()
+                        .text_color(rgb(0x8a909c))
+                        .child("no other devices on the tailnet"),
+                );
+            } else {
+                column = column.children(peer_rows);
+            }
+
+            div()
+                .id("home")
+                .size_full()
+                .overflow_y_scroll()
+                .bg(rgb(0x14161a))
+                .flex()
+                .justify_center()
+                .py_8()
+                .px_4()
+                .child(column)
+                .into_any_element()
+        }
     }
 
     /// Translates a GPUI mouse button to the protocol's.
@@ -659,6 +1044,12 @@ mod app {
         }
     }
 
+    impl Drop for Viewer {
+        fn drop(&mut self) {
+            self.shared.quit();
+        }
+    }
+
     impl Render for Viewer {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             window.request_animation_frame();
@@ -668,15 +1059,40 @@ mod app {
             } else {
                 self.publish_window_handle(window);
             }
-            if !self.focused_once {
+            // Keep keyboard focus on the root: GPUI drops it when the window deactivates, and
+            // nothing else in this window ever takes it.
+            if !self.focused_once || (window.is_window_active() && !self.focus.is_focused(window)) {
                 self.focused_once = true;
                 window.focus(&self.focus);
             }
             if self.mode == Mode::Remote {
-                self.sync_clipboard(window, cx);
+                if let Some((target, name)) = self.pending.take() {
+                    if self.hwnd.is_some() {
+                        self.connect(target, name);
+                    } else {
+                        self.pending = Some((target, name));
+                    }
+                }
+                self.poll_session_end();
+                if self.screen == Screen::Session {
+                    self.sync_clipboard(window, cx);
+                }
             }
             self.update_status();
 
+            let root = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .text_color(rgb(0xdddddd))
+                .track_focus(&self.focus)
+                .on_key_down(cx.listener(Self::on_key));
+
+            if self.mode == Mode::Remote && self.screen == Screen::Home {
+                return root.child(self.render_home(cx));
+            }
+
+            let in_session = self.mode == Mode::Remote;
             let content = match self.mode {
                 Mode::LoopbackImage => match &self.image {
                     Some(image) => img(ImageSource::Render(image.clone()))
@@ -707,19 +1123,12 @@ mod app {
                     .into_any_element()
                 }
             };
-            let cursor = if self.mode == Mode::Remote {
+            let cursor = if in_session {
                 self.cursor_element(window)
             } else {
                 None
             };
 
-            let root = div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .text_color(rgb(0xdddddd))
-                .track_focus(&self.focus)
-                .on_key_down(cx.listener(Self::on_key));
             // In composition modes the video area must stay unpainted so the visual
             // underneath shows through; only the status bar gets a background.
             let root = if self.mode.uses_composition() {
@@ -727,19 +1136,31 @@ mod app {
             } else {
                 root.bg(rgb(0x101010))
             };
-            root.child(
-                div()
-                    .h(px(26.0))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .text_sm()
-                    .bg(rgb(0x101010))
-                    .child(self.status.clone()),
-            )
-            .child({
+            let mut bar = div()
+                .h(px(26.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_sm()
+                .bg(rgb(0x101010))
+                .child(div().flex_1().child(self.status.clone()));
+            if in_session {
+                bar = bar.child(
+                    div()
+                        .id("disconnect")
+                        .px_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(rgb(0xaaaaaa))
+                        .hover(|s| s.bg(rgb(0x333333)).text_color(rgb(0xffffff)))
+                        .on_click(cx.listener(|this, _, _, _| this.disconnect()))
+                        .child("disconnect"),
+                );
+            }
+            root.child(bar).child({
                 let mut area = div().flex_1().min_h_0().relative();
-                if self.mode == Mode::Remote {
+                if in_session {
                     area = area
                         .on_mouse_move(cx.listener(Self::on_mouse_move))
                         .on_scroll_wheel(cx.listener(Self::on_scroll));
