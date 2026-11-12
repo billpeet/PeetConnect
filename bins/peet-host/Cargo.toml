@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 peet-capture.workspace = true
+peet-input.workspace = true
 peet-codec.workspace = true
 peet-proto.workspace = true
 peet-tailscale.workspace = true

@@ -233,19 +233,15 @@ async fn control_loop(
     Ok(())
 }
 
-/// Input arrives on its own stream. Injection lands in milestone 4; for now we drain and
-/// count so a viewer that sends input early does not stall on flow control.
+/// Input arrives on its own stream. Each stream gets a task that injects every event into the
+/// interactive desktop via `SendInput`. Injection runs on a dedicated blocking thread so a slow
+/// FFI call never stalls the async runtime, and so every event for a stream keeps the same
+/// desktop attachment.
 async fn accept_input_streams(connection: quinn::Connection, session_id: SessionId) {
     loop {
         match peet_transport::accept_uni(&connection).await {
-            Ok((StreamKind::Input, mut recv)) => {
-                tokio::spawn(async move {
-                    let mut count: u64 = 0;
-                    while let Ok(Some(_event)) = recv.recv::<InputEvent>().await {
-                        count += 1;
-                    }
-                    tracing::debug!(session = session_id.0, count, "input stream ended");
-                });
+            Ok((StreamKind::Input, recv)) => {
+                tokio::spawn(inject_input_stream(recv, session_id));
             }
             Ok((kind, _)) => tracing::debug!(session = session_id.0, ?kind, "unexpected stream"),
             Err(TransportError::Connection(_)) => break,
@@ -255,6 +251,34 @@ async fn accept_input_streams(connection: quinn::Connection, session_id: Session
             }
         }
     }
+}
+
+/// Reads input events off one stream and feeds them to a blocking injector thread.
+async fn inject_input_stream(mut recv: FramedRecv, session_id: SessionId) {
+    // A bounded channel bridges async reads to the synchronous SendInput thread. Input is tiny,
+    // so a shallow queue keeps latency low while absorbing short stalls.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent>(256);
+    let worker = std::thread::spawn(move || {
+        let mut injector = peet_input::Injector::new();
+        let mut count: u64 = 0;
+        while let Ok(event) = rx.recv() {
+            if let Err(err) = injector.inject(&event) {
+                tracing::debug!(session = session_id.0, %err, "input injection failed");
+            }
+            count += 1;
+        }
+        count
+    });
+    while let Ok(Some(event)) = recv.recv::<InputEvent>().await {
+        if tx.send(event).is_err() {
+            break;
+        }
+    }
+    drop(tx);
+    let count = tokio::task::spawn_blocking(move || worker.join().unwrap_or(0))
+        .await
+        .unwrap_or(0);
+    tracing::debug!(session = session_id.0, count, "input stream ended");
 }
 
 pub fn parse_backend(name: &str) -> Backend {

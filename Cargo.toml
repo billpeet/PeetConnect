@@ -13,6 +13,7 @@ rust-version = "1.88"
 peet-capture = { path = "crates/peet-capture" }
 peet-codec = { path = "crates/peet-codec" }
 peet-core = { path = "crates/peet-core" }
+peet-input = { path = "crates/peet-input" }
 peet-proto = { path = "crates/peet-proto" }
 peet-tailscale = { path = "crates/peet-tailscale" }
 peet-transport = { path = "crates/peet-transport" }
@@ -52,6 +53,7 @@ windows = { version = "0.62", features = [
   "Win32_System_Ole",
   "Win32_System_Threading",
   "Win32_System_Variant",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_HiDpi",
   "Win32_UI_WindowsAndMessaging",
 ] }

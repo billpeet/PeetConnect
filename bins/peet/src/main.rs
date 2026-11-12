@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use peet_core::{ConnectOptions, Session};
-use peet_proto::Codec;
+use peet_proto::{Codec, InputEvent, MouseButton};
 use peet_tailscale::{LocalApi, PeerStatus, Status};
 
 #[derive(Debug, Parser)]
@@ -63,8 +63,94 @@ enum Command {
         #[arg(long)]
         pin: Option<String>,
     },
+    /// Move the pointer. X and Y are monitor-relative pixels unless --absolute is given.
+    Move {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        x: i32,
+        y: i32,
+        /// Monitor ID the coordinates are relative to; default is the primary.
+        #[arg(long)]
+        monitor: Option<u32>,
+        /// Treat X and Y as host virtual-desktop coordinates instead.
+        #[arg(long)]
+        absolute: bool,
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Click a mouse button, optionally moving to X Y first.
+    Click {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        /// Monitor-relative X (requires Y). Omit to click at the current position.
+        x: Option<i32>,
+        /// Monitor-relative Y.
+        y: Option<i32>,
+        #[arg(long, value_enum, default_value_t = CliButton::Left)]
+        button: CliButton,
+        /// Send two clicks in quick succession.
+        #[arg(long)]
+        double: bool,
+        #[arg(long)]
+        monitor: Option<u32>,
+        #[arg(long)]
+        absolute: bool,
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Scroll the wheel. Positive dy scrolls up, positive dx scrolls right (notches).
+    Scroll {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+        dy: i32,
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+        dx: i32,
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Type Unicode text on the host.
+    Type {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        /// Text to type.
+        text: String,
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Press a key chord such as `enter`, `ctrl+c` or `ctrl+alt+delete`.
+    Key {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        /// Key chord: names joined with `+` (see docs for the key list).
+        chord: String,
+        #[arg(long)]
+        pin: Option<String>,
+    },
     /// Print protocol constants for this build.
     Version,
+}
+
+/// Mouse button names accepted on the command line.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliButton {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+impl From<CliButton> for MouseButton {
+    fn from(b: CliButton) -> Self {
+        match b {
+            CliButton::Left => MouseButton::Left,
+            CliButton::Right => MouseButton::Right,
+            CliButton::Middle => MouseButton::Middle,
+            CliButton::Back => MouseButton::Back,
+            CliButton::Forward => MouseButton::Forward,
+        }
+    }
 }
 
 #[tokio::main]
@@ -226,6 +312,125 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Move {
+            host,
+            x,
+            y,
+            monitor,
+            absolute,
+            pin,
+        } => {
+            let session = open_session(&host, pin).await?;
+            let (vx, vy) = virtual_point(session.info(), monitor, x, y, absolute)?;
+            session
+                .control()
+                .send_input(InputEvent::MouseMove { x: vx, y: vy });
+            finish_input(&session).await;
+            session.close("done");
+            if cli.json {
+                print_json(&serde_json::json!({ "x": vx, "y": vy }))?;
+            } else {
+                eprintln!("moved to {vx},{vy}");
+            }
+        }
+        Command::Click {
+            host,
+            x,
+            y,
+            button,
+            double,
+            monitor,
+            absolute,
+            pin,
+        } => {
+            let session = open_session(&host, pin).await?;
+            let control = session.control();
+            match (x, y) {
+                (Some(x), Some(y)) => {
+                    let (vx, vy) = virtual_point(session.info(), monitor, x, y, absolute)?;
+                    control.send_input(InputEvent::MouseMove { x: vx, y: vy });
+                }
+                (None, None) => {}
+                _ => anyhow::bail!("click needs both X and Y, or neither"),
+            }
+            let button = MouseButton::from(button);
+            let clicks = if double { 2 } else { 1 };
+            for _ in 0..clicks {
+                control.send_input(InputEvent::MouseButton {
+                    button,
+                    pressed: true,
+                });
+                control.send_input(InputEvent::MouseButton {
+                    button,
+                    pressed: false,
+                });
+            }
+            finish_input(&session).await;
+            session.close("done");
+            if !cli.json {
+                eprintln!("clicked {button:?}");
+            }
+        }
+        Command::Scroll { host, dy, dx, pin } => {
+            let session = open_session(&host, pin).await?;
+            // Protocol deltas are 1/120 units; one notch is 120.
+            session.control().send_input(InputEvent::MouseWheel {
+                delta_x: dx * 120,
+                delta_y: dy * 120,
+            });
+            finish_input(&session).await;
+            session.close("done");
+            if !cli.json {
+                eprintln!("scrolled dx={dx} dy={dy}");
+            }
+        }
+        Command::Type { host, text, pin } => {
+            let session = open_session(&host, pin).await?;
+            session
+                .control()
+                .send_input(InputEvent::Text { text: text.clone() });
+            finish_input(&session).await;
+            session.close("done");
+            if cli.json {
+                print_json(&serde_json::json!({ "typed": text }))?;
+            } else {
+                eprintln!("typed {} characters", text.chars().count());
+            }
+        }
+        Command::Key { host, chord, pin } => {
+            let names = peet_input::keys::parse_chord(&chord);
+            if names.is_empty() {
+                anyhow::bail!("empty key chord");
+            }
+            let mut keys = Vec::with_capacity(names.len());
+            for name in &names {
+                let key = peet_input::keys::lookup(name)
+                    .with_context(|| format!("unknown key `{name}`"))?;
+                keys.push(key);
+            }
+            let session = open_session(&host, pin).await?;
+            let control = session.control();
+            // Press in order, release in reverse, so modifiers wrap the final key.
+            for key in &keys {
+                control.send_input(InputEvent::Key {
+                    scancode: key.scancode,
+                    extended: key.extended,
+                    pressed: true,
+                });
+            }
+            for key in keys.iter().rev() {
+                control.send_input(InputEvent::Key {
+                    scancode: key.scancode,
+                    extended: key.extended,
+                    pressed: false,
+                });
+            }
+            finish_input(&session).await;
+            session.close("done");
+            if !cli.json {
+                eprintln!("sent {chord}");
+            }
+        }
         Command::Version => {
             if cli.json {
                 print_json(&serde_json::json!({
@@ -242,6 +447,40 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Flushes queued input and gives the host a moment to receive and inject it before the caller
+/// closes the connection.
+async fn finish_input(session: &Session) {
+    session.control().flush_input().await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+}
+
+/// Maps a monitor-relative (or absolute) point to host virtual-desktop coordinates.
+fn virtual_point(
+    info: &peet_core::SessionInfo,
+    monitor: Option<u32>,
+    x: i32,
+    y: i32,
+    absolute: bool,
+) -> Result<(i32, i32)> {
+    if absolute {
+        return Ok((x, y));
+    }
+    let target = match monitor {
+        Some(id) => info
+            .monitors
+            .iter()
+            .find(|m| m.id.0 == id)
+            .with_context(|| format!("host has no monitor {id}"))?,
+        None => info
+            .monitors
+            .iter()
+            .find(|m| m.primary)
+            .or(info.monitors.first())
+            .context("host reports no monitors")?,
+    };
+    Ok((target.bounds.x + x, target.bounds.y + y))
 }
 
 async fn open_session(host: &str, pin: Option<String>) -> Result<Session> {

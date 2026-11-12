@@ -69,7 +69,23 @@ cargo run --release -p peet -- monitors <host>                      # headless: 
 cargo run --release -p peet -- screenshot <host> -o shot.png        # headless: PNG still
 ```
 
-Keys 1-9 switch monitors in the viewer. Input injection is not implemented yet.
+The viewer forwards mouse and keyboard to the host. `Ctrl+Alt+1`..`9` switch monitors locally;
+every other key reaches the remote machine. The host injects input with `SendInput` and so
+drives whatever has focus in the interactive session.
+
+The CLI drives input headlessly, which is how an agent clicks and types without a window:
+
+```
+cargo run --release -p peet -- move  <host> 400 300          # pointer to monitor-relative x y
+cargo run --release -p peet -- click <host> 400 300          # move then left-click
+cargo run --release -p peet -- type  <host> "hello world"    # Unicode text
+cargo run --release -p peet -- key   <host> ctrl+alt+delete  # a key chord
+cargo run --release -p peet -- scroll <host> --dy 3          # wheel notches
+```
+
+Coordinates are relative to the chosen monitor (`--monitor`, default primary) unless
+`--absolute` is given. The service that injects into the lock screen and other secure desktops
+is still to come; today the host runs as a normal process in the interactive session.
 
 ## Development
 

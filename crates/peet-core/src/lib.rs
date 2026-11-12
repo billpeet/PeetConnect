@@ -273,7 +273,7 @@ struct Shared {
 #[derive(Debug, Clone)]
 pub struct Control {
     tx: mpsc::Sender<ControlMessage>,
-    input_tx: mpsc::Sender<InputEvent>,
+    input_tx: mpsc::Sender<InputCmd>,
     shared: Arc<Shared>,
 }
 
@@ -314,7 +314,17 @@ impl Control {
     /// Queues an input event. Input has its own stream so it is never stuck behind control
     /// traffic. Returns false if the queue is full.
     pub fn send_input(&self, event: InputEvent) -> bool {
-        self.input_tx.try_send(event).is_ok()
+        self.input_tx.try_send(InputCmd::Event(event)).is_ok()
+    }
+
+    /// Waits until every input event queued so far has been flushed onto the wire. Callers that
+    /// send input and then close immediately (such as one-shot CLI commands) use this so the
+    /// host receives the events before the connection goes away.
+    pub async fn flush_input(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.input_tx.send(InputCmd::Flush(tx)).await.is_ok() {
+            let _ = rx.await;
+        }
     }
 
     /// Requests a still image and waits for it.
@@ -506,22 +516,40 @@ async fn video_reader(mut recv: FramedRecv, events: mpsc::Sender<Event>) {
     }
 }
 
-async fn input_writer(connection: quinn::Connection, mut rx: mpsc::Receiver<InputEvent>) {
+/// What the input stream task consumes: events to send, or a flush barrier that resolves once
+/// everything queued before it has been written to the socket.
+#[derive(Debug)]
+enum InputCmd {
+    Event(InputEvent),
+    Flush(oneshot::Sender<()>),
+}
+
+async fn input_writer(connection: quinn::Connection, mut rx: mpsc::Receiver<InputCmd>) {
     let mut stream: Option<FramedSend> = None;
-    while let Some(event) = rx.recv().await {
-        if stream.is_none() {
-            match peet_transport::open_uni(&connection, StreamKind::Input).await {
-                Ok(s) => stream = Some(s),
-                Err(err) => {
-                    tracing::debug!(%err, "could not open input stream");
-                    break;
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            InputCmd::Event(event) => {
+                if stream.is_none() {
+                    match peet_transport::open_uni(&connection, StreamKind::Input).await {
+                        Ok(s) => stream = Some(s),
+                        Err(err) => {
+                            tracing::debug!(%err, "could not open input stream");
+                            break;
+                        }
+                    }
+                }
+                if let Some(s) = stream.as_mut() {
+                    if let Err(err) = s.send(&event).await {
+                        tracing::debug!(%err, "input stream write failed");
+                        break;
+                    }
                 }
             }
-        }
-        if let Some(s) = stream.as_mut() {
-            if let Err(err) = s.send(&event).await {
-                tracing::debug!(%err, "input stream write failed");
-                break;
+            InputCmd::Flush(done) => {
+                // The channel is processed in order, so reaching this barrier means every event
+                // queued earlier is already written into quinn's send buffer. quinn transmits it
+                // on its own; the caller adds a short grace period before closing.
+                let _ = done.send(());
             }
         }
     }

@@ -15,6 +15,7 @@ image.workspace = true
 peet-capture.workspace = true
 peet-codec.workspace = true
 peet-core.workspace = true
+peet-input.workspace = true
 peet-proto.workspace = true
 raw-window-handle = "0.6"
 smallvec = "1"

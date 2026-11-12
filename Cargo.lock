@@ -4047,6 +4047,7 @@ dependencies = [
  "clap",
  "gethostname",
  "peet-core",
+ "peet-input",
  "peet-proto",
  "peet-tailscale",
  "serde_json",
@@ -4111,6 +4112,7 @@ dependencies = [
  "image",
  "peet-capture",
  "peet-codec",
+ "peet-input",
  "peet-proto",
  "peet-tailscale",
  "peet-transport",
@@ -4120,6 +4122,16 @@ dependencies = [
  "toml 1.2.1+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "peet-input"
+version = "0.1.0"
+dependencies = [
+ "peet-proto",
+ "thiserror 2.0.21",
+ "tracing",
  "windows 0.62.2",
 ]
 
@@ -4173,6 +4185,7 @@ dependencies = [
  "peet-capture",
  "peet-codec",
  "peet-core",
+ "peet-input",
  "peet-proto",
  "raw-window-handle",
  "smallvec",

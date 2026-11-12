@@ -15,7 +15,7 @@ use image::{Frame, ImageBuffer};
 use peet_capture::windows::D3dDevice;
 use peet_codec::windows::MfH264Decoder;
 use peet_core::{ConnectOptions, Control, Event};
-use peet_proto::{ControlMessage, CursorShape, MonitorId, MonitorInfo, VideoFrame};
+use peet_proto::{ControlMessage, CursorShape, InputEvent, MonitorId, MonitorInfo, VideoFrame};
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HWND;
@@ -63,6 +63,12 @@ pub struct RemoteShared {
 impl RemoteShared {
     pub fn status(&self) -> RemoteStatus {
         self.status.lock().expect("status poisoned").clone()
+    }
+
+    /// Forwards an input event to the host, if connected. Returns false if dropped.
+    pub fn send_input(&self, event: InputEvent) -> bool {
+        let control = self.control.lock().expect("control poisoned").clone();
+        control.is_some_and(|c| c.send_input(event))
     }
 
     /// Switches the video stream to another monitor.
