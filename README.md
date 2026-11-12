@@ -2,9 +2,21 @@
 
 # PeetConnect
 
+[![CI](https://github.com/billpeet/peetconnect/actions/workflows/ci.yml/badge.svg)](https://github.com/billpeet/peetconnect/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Fast, lightweight remote desktop built for Tailscale. Rust end to end, MIT licensed.
 
-Status: early development. See [docs/PLAN.md](docs/PLAN.md) for architecture and milestones.
+- **Tailscale-native.** Hosts are reached by MagicDNS name or 100.x address and authorise viewers
+  by their tailnet identity (`whois`), so there is no account, relay or port forwarding.
+- **Low latency.** DXGI capture, hardware H.264 (Media Foundation), QUIC transport, DXVA decode
+  straight into a DirectComposition surface. Several monitors at once, laid out as on the host.
+- **Agent-friendly.** A headless CLI and an MCP server let an LLM agent see and drive a machine
+  without a window.
+- **Unattended.** Runs as a console app or as a Windows service that follows the active session.
+
+Status: early development, Windows host and viewer. Clean-room, no AnyDesk or RustDesk code.
+See [docs/PLAN.md](docs/PLAN.md) for architecture, decisions and milestones.
 
 ## Layout
 
@@ -147,3 +159,7 @@ cargo test --workspace
 ```
 
 CI runs the same on Windows and Ubuntu with warnings denied.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
