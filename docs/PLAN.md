@@ -217,19 +217,28 @@ pushes its own changes while active; one last-seen value guards both directions 
 recents, an address box, click-to-connect; `Ctrl+Alt+D` or a status-bar button disconnects back
 to it. Settings persist in `%APPDATA%\PeetConnectiewer.toml` (fps, bitrate, favourites,
 recents). `--loopback` now selects the M2 test rig; no arguments opens the home screen.
+*Multi-monitor layout* — `Ctrl+Alt+0` streams every monitor at once, laid out as on the host
+(uniformly scaled, centred); `Ctrl+Alt+<n>` goes back to one. The presenter keeps its single
+composition swap chain and gives each visible monitor its own GPU converter whose output lands
+in that monitor's tile; every present clears the back buffer and composites the latest tile of
+each monitor. The presenter publishes the tile rectangles, and the UI maps pointer positions and
+places the remote cursor through them (outside every tile the nearest one is used, clamped), so
+input works across monitors. The decoder keeps one H.264 decoder per visible monitor.
 
 Verified on the dev box's own Tailscale IP: kill-and-restart of the host reconnected in ~11 s with
 a rebuilt decoder; a host-side clipboard change arrived at the viewer; the home screen was driven
 end to end by injected input (click the address box, scancode-type the IP, Enter → 60 fps session,
-`Ctrl+Alt+D` → home with the new recent). Finding: GPUI ignores `VK_PACKET` key events, so
+`Ctrl+Alt+D` → home with the new recent); `Ctrl+Alt+0` showed both dev-box monitors side by
+side at 60 fps and `Ctrl+Alt+2` returned to one (second decoder created, first stream disabled on
+the host). Finding: GPUI ignores `VK_PACKET` key events, so
 `peet type` cannot type into a GPUI window (use `peet key` scancodes); physical keyboards are
 unaffected. Injected clicks do activate the GPUI window, which lifts the old "cannot focus the
 viewer from automation" limit for keyboard testing.
 
-Not done: multi-monitor layout (all monitors at once as extra composition visuals), file
-transfer, host tray app, a settings UI (values are file-only), PIN entry on the home screen.
-Exit — replaces AnyDesk for personal use — needs at least the multi-monitor layout and a second
-real machine.
+Not done: file transfer, host tray app, a settings UI (values are file-only), PIN entry on the
+home screen, per-monitor bitrate budgeting in all-monitors mode (each stream keeps the full
+cap). Exit — replaces AnyDesk for personal use — is close for the viewer side; it still needs a
+second real machine and the service verified for unattended use.
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer, signing + auto-update, distribution.

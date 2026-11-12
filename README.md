@@ -77,8 +77,9 @@ and the default fps/bitrate persist in `%APPDATA%\PeetConnectiewer.toml`. Hosts
 PIN are reached with `--connect <host> --pin <pin>` for now.
 
 In a session the viewer forwards mouse and keyboard to the host. `Ctrl+Alt+1`..`9` switch
-monitors locally, `Ctrl+Alt+D` (or the status-bar button) disconnects back to the home
-screen; every other key reaches the remote machine. The host injects input with `SendInput`
+monitors locally, `Ctrl+Alt+0` shows every monitor at once laid out as on the host, and
+`Ctrl+Alt+D` (or the status-bar button) disconnects back to the home screen; every other key
+reaches the remote machine. The host injects input with `SendInput`
 and so drives whatever has focus in the interactive session. The clipboard syncs both ways
 (text only): copy on either side and paste on the other. If the connection drops, the viewer
 reconnects on its own with backoff and returns to the monitor you were watching; a host that

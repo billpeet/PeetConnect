@@ -106,7 +106,10 @@ pub fn run(config: Config) -> Result<()> {
                 .recv()
                 .context("UI never provided its window handle")?;
             let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-            Sink::D3d(Presenter::new(device.clone(), hwnd, placement, vsync)?)
+            Sink::D3d(
+                Presenter::new(device.clone(), hwnd, placement, Arc::default(), vsync)?,
+                monitor.to_proto(),
+            )
         }
     };
     tracing::info!(
@@ -169,14 +172,14 @@ pub fn run(config: Config) -> Result<()> {
 
 enum Sink {
     Gpui(Readback),
-    D3d(Presenter),
+    D3d(Presenter, peet_proto::MonitorInfo),
 }
 
 impl Sink {
     fn name(&self) -> &'static str {
         match self {
             Sink::Gpui(_) => "gpui-image",
-            Sink::D3d(_) => "d3d-dcomp",
+            Sink::D3d(..) => "d3d-dcomp",
         }
     }
 
@@ -187,7 +190,9 @@ impl Sink {
     ) -> Result<()> {
         match self {
             Sink::Gpui(readback) => readback.deliver(frame, captured_at),
-            Sink::D3d(presenter) => presenter.present(frame),
+            Sink::D3d(presenter, info) => {
+                presenter.present(info.id, frame, std::slice::from_ref(info))
+            }
         }
     }
 }

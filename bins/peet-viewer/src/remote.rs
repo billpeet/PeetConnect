@@ -5,6 +5,7 @@
 //! the DirectComposition presenter. The UI thread only reads [`RemoteShared`] and sends
 //! control messages through the session's [`Control`] handle.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -21,7 +22,7 @@ use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HWND;
 
-use crate::present::{Presenter, SharedPlacement};
+use crate::present::{Presenter, SharedPlacement, SharedTiles};
 
 /// Everything the UI shows about the session.
 #[derive(Debug, Default, Clone)]
@@ -29,6 +30,8 @@ pub struct RemoteStatus {
     pub host_name: String,
     pub monitors: Vec<MonitorInfo>,
     pub current: Option<MonitorId>,
+    /// Show every monitor at once, laid out as on the host.
+    pub all_monitors: bool,
     pub frame_size: (u32, u32),
     pub fps: f64,
     pub decode_ms: f64,
@@ -59,6 +62,8 @@ pub struct RemoteShared {
     pub status: Mutex<RemoteStatus>,
     pub cursor: Mutex<CursorOverlay>,
     pub control: Mutex<Option<Control>>,
+    /// Where each visible monitor is drawn, published by the presenter.
+    pub tiles: SharedTiles,
     /// Set by the UI to end the session for good (no reconnect).
     pub quit: AtomicBool,
     /// Bumped per connection so the decoder starts clean after a reconnect.
@@ -99,18 +104,34 @@ impl RemoteShared {
         control.is_some_and(|c| c.send_input(event))
     }
 
-    /// Switches the video stream to another monitor.
+    /// Shows one monitor, stopping the streams of any others.
     pub fn select_monitor(&self, monitor: MonitorId) {
         let control = self.control.lock().expect("control poisoned").clone();
         let Some(control) = control else { return };
-        let previous = {
+        let disable: Vec<MonitorId> = {
             let mut status = self.status.lock().expect("status poisoned");
-            if status.current == Some(monitor) {
+            if !status.all_monitors && status.current == Some(monitor) {
                 return;
             }
-            status.current.replace(monitor)
+            let disable = if status.all_monitors {
+                status
+                    .monitors
+                    .iter()
+                    .map(|m| m.id)
+                    .filter(|&m| m != monitor)
+                    .collect()
+            } else {
+                status
+                    .current
+                    .into_iter()
+                    .filter(|&m| m != monitor)
+                    .collect()
+            };
+            status.all_monitors = false;
+            status.current = Some(monitor);
+            disable
         };
-        if let Some(previous) = previous {
+        for previous in disable {
             control.try_send(ControlMessage::SetStream {
                 monitor: previous,
                 enabled: false,
@@ -124,6 +145,28 @@ impl RemoteShared {
             max_fps: None,
             max_bitrate_kbps: None,
         });
+    }
+
+    /// Shows every monitor at once.
+    pub fn select_all(&self) {
+        let control = self.control.lock().expect("control poisoned").clone();
+        let Some(control) = control else { return };
+        let monitors: Vec<MonitorId> = {
+            let mut status = self.status.lock().expect("status poisoned");
+            if status.all_monitors {
+                return;
+            }
+            status.all_monitors = true;
+            status.monitors.iter().map(|m| m.id).collect()
+        };
+        for monitor in monitors {
+            control.try_send(ControlMessage::SetStream {
+                monitor,
+                enabled: true,
+                max_fps: None,
+                max_bitrate_kbps: None,
+            });
+        }
     }
 }
 
@@ -251,8 +294,14 @@ async fn session(
         .with_context(|| format!("connecting to {addr}"))?;
     let (info, control, mut events, guard) = session.split();
 
-    // After a reconnect, go back to the monitor the user was watching.
-    let wanted = shared.status().current.map(|m| m.0).or(config.monitor);
+    // After a reconnect, go back to what the user was watching.
+    let (wanted, all_monitors) = {
+        let status = shared.status();
+        (
+            status.current.map(|m| m.0).or(config.monitor),
+            status.all_monitors,
+        )
+    };
     let monitor = info
         .monitors
         .iter()
@@ -269,14 +318,21 @@ async fn session(
         status.message = String::new();
     }
     *shared.control.lock().expect("control poisoned") = Some(control.clone());
-    control
-        .set_stream(
-            monitor,
-            true,
-            Some(u16::try_from(config.fps).unwrap_or(60)),
-            Some(config.bitrate_kbps),
-        )
-        .await?;
+    let wanted_streams: Vec<MonitorId> = if all_monitors {
+        info.monitors.iter().map(|m| m.id).collect()
+    } else {
+        vec![monitor]
+    };
+    for id in wanted_streams {
+        control
+            .set_stream(
+                id,
+                true,
+                Some(u16::try_from(config.fps).unwrap_or(60)),
+                Some(config.bitrate_kbps),
+            )
+            .await?;
+    }
 
     let mut rtt_tick = tokio::time::interval(Duration::from_secs(1));
     let mut quit_tick = tokio::time::interval(Duration::from_millis(100));
@@ -365,6 +421,14 @@ fn shape_image(shape: CursorShape) -> Option<Arc<RenderImage>> {
     ))))
 }
 
+/// Decoder state for one monitor's stream.
+struct Dec {
+    decoder: MfH264Decoder,
+    size: (u32, u32),
+    last_seq: u64,
+    waiting_for_keyframe: bool,
+}
+
 fn decode_loop(
     mut frames: mpsc::Receiver<VideoFrame>,
     window: &Receiver<isize>,
@@ -377,74 +441,97 @@ fn decode_loop(
         .context("UI never provided its window handle")?;
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);
     let device = D3dDevice::for_adapter(0)?;
-    let mut presenter = Presenter::new(device.clone(), hwnd, placement, vsync)?;
+    let mut presenter =
+        Presenter::new(device.clone(), hwnd, placement, shared.tiles.clone(), vsync)?;
 
-    let mut decoder: Option<MfH264Decoder> = None;
-    let mut decoder_size = (0u32, 0u32);
-    let mut monitor: Option<MonitorId> = None;
-    let mut last_seq: u64 = 0;
-    let mut waiting_for_keyframe = true;
-    let mut last_keyframe_request = Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap_or_else(Instant::now);
+    let long_ago = || {
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now)
+    };
+    let mut decoders: HashMap<MonitorId, Dec> = HashMap::new();
+    let mut last_keyframe_request: HashMap<MonitorId, Instant> = HashMap::new();
     let mut period = Instant::now();
     let mut frames_in_period: u32 = 0;
     let mut decode_time = Duration::ZERO;
     let mut generation = shared.generation.load(Ordering::Relaxed);
 
     while let Some(frame) = frames.blocking_recv() {
-        let current = shared.status.lock().expect("status poisoned").current;
-        if current.is_some() && current != Some(frame.monitor) {
+        let (visible, current) = {
+            let status = shared.status.lock().expect("status poisoned");
+            let visible: Vec<MonitorInfo> = if status.all_monitors {
+                status.monitors.clone()
+            } else {
+                status
+                    .monitors
+                    .iter()
+                    .filter(|m| Some(m.id) == status.current)
+                    .cloned()
+                    .collect()
+            };
+            (visible, status.current)
+        };
+        if !visible.iter().any(|m| m.id == frame.monitor) {
             // Tail of a stream we switched away from.
+            decoders.remove(&frame.monitor);
             continue;
         }
-        // A reconnect restarts sequence numbers and may change the stream, so start clean.
+        // A reconnect restarts sequence numbers and may change the streams, so start clean.
         let now_generation = shared.generation.load(Ordering::Relaxed);
         if now_generation != generation {
             generation = now_generation;
-            decoder = None;
+            decoders.clear();
         }
         let size = (frame.width, frame.height);
         // Compare against the size we created the decoder with, not the decoder's own
         // report: it switches to the coded size (1088 rows for 1080p) after the first frame.
-        let needs_new_decoder =
-            monitor != Some(frame.monitor) || decoder.is_none() || decoder_size != size;
-        if needs_new_decoder {
-            decoder = Some(MfH264Decoder::new(size.0, size.1, &device.device)?);
-            decoder_size = size;
-            monitor = Some(frame.monitor);
-            waiting_for_keyframe = true;
-            last_seq = frame.seq.saturating_sub(1);
-            shared.status.lock().expect("status poisoned").frame_size = size;
+        if decoders.get(&frame.monitor).is_some_and(|d| d.size != size) {
+            decoders.remove(&frame.monitor);
         }
-        let lost = frame.seq != last_seq + 1 && frame.seq > last_seq;
-        last_seq = frame.seq;
+        if let std::collections::hash_map::Entry::Vacant(slot) = decoders.entry(frame.monitor) {
+            slot.insert(Dec {
+                decoder: MfH264Decoder::new(size.0, size.1, &device.device)?,
+                size,
+                last_seq: frame.seq.saturating_sub(1),
+                waiting_for_keyframe: true,
+            });
+            if current == Some(frame.monitor) || visible.len() == 1 {
+                shared.status.lock().expect("status poisoned").frame_size = size;
+            }
+        }
+        let dec = decoders.get_mut(&frame.monitor).expect("decoder ensured");
+        let lost = frame.seq != dec.last_seq + 1 && frame.seq > dec.last_seq;
+        dec.last_seq = frame.seq;
         if lost && !frame.keyframe {
-            waiting_for_keyframe = true;
+            dec.waiting_for_keyframe = true;
         }
-        if waiting_for_keyframe {
+        if dec.waiting_for_keyframe {
             if frame.keyframe {
-                waiting_for_keyframe = false;
+                dec.waiting_for_keyframe = false;
             } else {
-                request_keyframe(shared, frame.monitor, &mut last_keyframe_request);
+                let since = last_keyframe_request
+                    .entry(frame.monitor)
+                    .or_insert_with(long_ago);
+                request_keyframe(shared, frame.monitor, since);
                 continue;
             }
         }
-        let dec = decoder.as_mut().expect("decoder ensured");
         let t0 = Instant::now();
-        let pictures = match dec.decode(&frame.data, frame.pts_us) {
+        let pictures = match dec.decoder.decode(&frame.data, frame.pts_us) {
             Ok(pictures) => pictures,
             Err(err) => {
                 tracing::warn!(%err, seq = frame.seq, "decode failed; waiting for a keyframe");
-                decoder = None;
-                waiting_for_keyframe = true;
-                request_keyframe(shared, frame.monitor, &mut last_keyframe_request);
+                decoders.remove(&frame.monitor);
+                let since = last_keyframe_request
+                    .entry(frame.monitor)
+                    .or_insert_with(long_ago);
+                request_keyframe(shared, frame.monitor, since);
                 continue;
             }
         };
         decode_time += t0.elapsed();
         for picture in &pictures {
-            presenter.present(picture)?;
+            presenter.present(frame.monitor, picture, &visible)?;
             frames_in_period += 1;
         }
         if period.elapsed() >= Duration::from_secs(1) {

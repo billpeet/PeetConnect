@@ -476,12 +476,15 @@ mod app {
                 Mode::Remote => {
                     let s = self.shared.status();
                     if s.connected {
-                        let monitor = s
-                            .current
-                            .and_then(|id| s.monitors.iter().position(|m| m.id == id))
-                            .map_or(String::new(), |i| {
-                                format!("monitor {} of {}", i + 1, s.monitors.len())
-                            });
+                        let monitor = if s.all_monitors {
+                            format!("all {} monitors", s.monitors.len())
+                        } else {
+                            s.current
+                                .and_then(|id| s.monitors.iter().position(|m| m.id == id))
+                                .map_or(String::new(), |i| {
+                                    format!("monitor {} of {}", i + 1, s.monitors.len())
+                                })
+                        };
                         let rtt = s
                             .rtt_ms
                             .map_or(String::new(), |ms| format!("  |  rtt {ms:.0} ms"));
@@ -491,7 +494,7 @@ mod app {
                             String::new()
                         };
                         format!(
-                            "{}  |  {monitor}  |  {}x{}  |  {:.0} fps (host {})  |  {} kbit/s  |  decode {:.2} ms{rtt}{skipped}  |  ctrl+alt+1-{} monitor, ctrl+alt+d disconnect",
+                            "{}  |  {monitor}  |  {}x{}  |  {:.0} fps (host {})  |  {} kbit/s  |  decode {:.2} ms{rtt}{skipped}  |  ctrl+alt+1-{} monitor, ctrl+alt+0 all, ctrl+alt+d disconnect",
                             s.host_name,
                             s.frame_size.0,
                             s.frame_size.1,
@@ -552,6 +555,10 @@ mod app {
             if m.control && m.alt {
                 if ks.key == "d" {
                     self.disconnect();
+                    return;
+                }
+                if ks.key == "0" {
+                    self.shared.select_all();
                     return;
                 }
                 if let Some(index) = ks
@@ -723,56 +730,41 @@ mod app {
             }
         }
 
-        /// Maps a window-space pointer position to host virtual-desktop pixels, inverting the
-        /// letterbox the presenter uses. Returns `None` when there is no active monitor or the
-        /// video area has no size yet.
+        /// Maps a window-space pointer position to host virtual-desktop pixels through the
+        /// tiles the presenter published. Outside every tile the nearest one is used, clamped,
+        /// so dragging past an edge keeps working. `None` before the first frame.
         fn window_to_host(&self, position: Point<Pixels>, window: &Window) -> Option<(i32, i32)> {
-            let status = self.shared.status();
-            let current = status.current?;
-            let monitor = status.monitors.iter().find(|m| m.id == current)?;
-            let (fw, fh) = status.frame_size;
-            if fw == 0 || fh == 0 {
-                return None;
-            }
-            let placement = *self.placement.lock().ok()?;
-            if placement.width <= 0 || placement.height <= 0 {
-                return None;
-            }
             let device_scale = f64::from(window.scale_factor());
-            let scale = (f64::from(placement.width) / f64::from(fw))
-                .min(f64::from(placement.height) / f64::from(fh));
-            if scale <= 0.0 {
-                return None;
-            }
-            let shown_w = f64::from(fw) * scale;
-            let shown_h = f64::from(fh) * scale;
-            let off_x = f64::from(placement.x) + (f64::from(placement.width) - shown_w) / 2.0;
-            let off_y = f64::from(placement.y) + (f64::from(placement.height) - shown_h) / 2.0;
             let dev_x = f64::from(f32::from(position.x)) * device_scale;
             let dev_y = f64::from(f32::from(position.y)) * device_scale;
-            let frame_x = ((dev_x - off_x) / scale).clamp(0.0, f64::from(fw - 1));
-            let frame_y = ((dev_y - off_y) / scale).clamp(0.0, f64::from(fh - 1));
-            let vx = f64::from(monitor.bounds.x)
-                + frame_x * f64::from(monitor.bounds.width) / f64::from(fw);
-            let vy = f64::from(monitor.bounds.y)
-                + frame_y * f64::from(monitor.bounds.height) / f64::from(fh);
+            let tiles = self.shared.tiles.lock().ok()?.clone();
+            let tile = tiles
+                .iter()
+                .find(|t| {
+                    dev_x >= f64::from(t.rect.left)
+                        && dev_x < f64::from(t.rect.right)
+                        && dev_y >= f64::from(t.rect.top)
+                        && dev_y < f64::from(t.rect.bottom)
+                })
+                .or_else(|| {
+                    tiles.iter().min_by(|a, b| {
+                        rect_distance(a.rect, dev_x, dev_y)
+                            .total_cmp(&rect_distance(b.rect, dev_x, dev_y))
+                    })
+                })?;
+            let w = f64::from(tile.rect.right - tile.rect.left).max(1.0);
+            let h = f64::from(tile.rect.bottom - tile.rect.top).max(1.0);
+            let fx = ((dev_x - f64::from(tile.rect.left)) / w).clamp(0.0, 1.0);
+            let fy = ((dev_y - f64::from(tile.rect.top)) / h).clamp(0.0, 1.0);
+            let b = tile.bounds;
+            let vx = f64::from(b.x) + fx * f64::from(b.width.saturating_sub(1));
+            let vy = f64::from(b.y) + fy * f64::from(b.height.saturating_sub(1));
             Some((vx.round() as i32, vy.round() as i32))
         }
 
-        /// The remote cursor as an absolutely positioned image over the video, mapped through
-        /// the same letterbox the presenter uses.
+        /// The remote cursor as an absolutely positioned image over the video, placed through
+        /// the tile of the monitor it is on.
         fn cursor_element(&self, window: &mut Window) -> Option<gpui::AnyElement> {
-            let status = self.shared.status();
-            let current = status.current?;
-            let monitor = status.monitors.iter().find(|m| m.id == current)?;
-            let (fw, fh) = status.frame_size;
-            if fw == 0 || fh == 0 {
-                return None;
-            }
-            let placement = *self.placement.lock().ok()?;
-            if placement.width <= 0 || placement.height <= 0 {
-                return None;
-            }
             let mut cursor = self.shared.cursor.lock().ok()?;
             if let Some(retired) = cursor.retired.take() {
                 drop(cursor);
@@ -784,17 +776,21 @@ mod app {
                 return None;
             }
             let shape = cursor.shape.clone()?;
-            let scale = (f64::from(placement.width) / f64::from(fw))
-                .min(f64::from(placement.height) / f64::from(fh));
-            let shown_w = f64::from(fw) * scale;
-            let shown_h = f64::from(fh) * scale;
-            let off_x = f64::from(placement.x) + (f64::from(placement.width) - shown_w) / 2.0;
-            let off_y = f64::from(placement.y) + (f64::from(placement.height) - shown_h) / 2.0;
-            let local_x = f64::from(cursor.x - monitor.bounds.x) - f64::from(cursor.hotspot.0);
-            let local_y = f64::from(cursor.y - monitor.bounds.y) - f64::from(cursor.hotspot.1);
+            let tiles = self.shared.tiles.lock().ok()?.clone();
+            let tile = tiles.iter().find(|t| {
+                let b = t.bounds;
+                cursor.x >= b.x
+                    && cursor.y >= b.y
+                    && i64::from(cursor.x) < i64::from(b.x) + i64::from(b.width)
+                    && i64::from(cursor.y) < i64::from(b.y) + i64::from(b.height)
+            })?;
+            let scale =
+                f64::from(tile.rect.right - tile.rect.left) / f64::from(tile.bounds.width.max(1));
+            let local_x = f64::from(cursor.x - tile.bounds.x) - f64::from(cursor.hotspot.0);
+            let local_y = f64::from(cursor.y - tile.bounds.y) - f64::from(cursor.hotspot.1);
             let device_scale = f64::from(window.scale_factor());
-            let left = (off_x + local_x * scale) / device_scale;
-            let top = (off_y + local_y * scale) / device_scale;
+            let left = (f64::from(tile.rect.left) + local_x * scale) / device_scale;
+            let top = (f64::from(tile.rect.top) + local_y * scale) / device_scale;
             let width = f64::from(cursor.size.0) * scale / device_scale;
             let height = f64::from(cursor.size.1) * scale / device_scale;
             Some(
@@ -1031,6 +1027,13 @@ mod app {
                 .child(column)
                 .into_any_element()
         }
+    }
+
+    /// Distance from a point to a rectangle (zero inside).
+    fn rect_distance(r: windows::Win32::Foundation::RECT, x: f64, y: f64) -> f64 {
+        let dx = (f64::from(r.left) - x).max(0.0).max(x - f64::from(r.right));
+        let dy = (f64::from(r.top) - y).max(0.0).max(y - f64::from(r.bottom));
+        dx.hypot(dy)
     }
 
     /// Translates a GPUI mouse button to the protocol's.
