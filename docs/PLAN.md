@@ -235,10 +235,22 @@ the host). Finding: GPUI ignores `VK_PACKET` key events, so
 unaffected. Injected clicks do activate the GPUI window, which lifts the old "cannot focus the
 viewer from automation" limit for keyboard testing.
 
+**Second machine, 2026-11-13.** First real cross-machine test: release binaries Taildropped to
+DESKTOP-ER4U7GP (Windows 11, AMD iGPU + RTX 4060 Ti, three monitors: 3840x2160 at 150%, 1920x1080,
+and a 1080x1920 portrait), host started there as `--console` by a non-admin user with no firewall
+rule added. From FUTURA-GPC over Tailscale (rtt ~18 ms): `peet monitors` and PNG screenshots of all
+three monitors worked with no firewall prompt; clipboard set/get round-tripped; `win+r`, typing
+and Enter opened Notepad on the remote and a paced Unicode sentence landed intact; the viewer
+decoded the 4K primary (DXGI + NVIDIA MFT on the host, 0.24 ms decode here) and `Ctrl+Alt+0` laid
+all three monitors out correctly including the portrait one, each stream on DXGI + NVENC. Fix that
+came out of it: QUIC path-MTU probing produced WSAEMSGSIZE warnings on both ends because
+Tailscale's MTU is 1280; probing is now disabled and the 1200-byte initial MTU is kept.
+Observed but not yet tuned: the 4K stream ran at ~19 fps host-side on that machine.
+
 Not done: file transfer, host tray app, a settings UI (values are file-only), PIN entry on the
 home screen, per-monitor bitrate budgeting in all-monitors mode (each stream keeps the full
-cap). Exit — replaces AnyDesk for personal use — is close for the viewer side; it still needs a
-second real machine and the service verified for unattended use.
+cap). Exit — replaces AnyDesk for personal use — is close for the viewer side; the service still
+needs an administrator to verify unattended use (neither test machine's user is one).
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer, signing + auto-update, distribution.

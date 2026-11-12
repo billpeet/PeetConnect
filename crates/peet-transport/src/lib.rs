@@ -95,6 +95,10 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
             .expect("idle timeout fits quinn's range"),
     ));
     transport.keep_alive_interval(Some(KEEP_ALIVE));
+    // Tailscale's interface MTU is 1280 (1252 bytes of UDP payload over IPv4), so path MTU
+    // probing can only fail: on Windows every probe above that logs a WSAEMSGSIZE error. Stay
+    // at the 1200-byte initial MTU, which is ample for video, and do not probe.
+    transport.mtu_discovery_config(None);
     // Video frames at 4K can exceed a megabyte on a keyframe; give each stream and the
     // connection enough window that a burst does not stall on flow control.
     transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
