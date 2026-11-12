@@ -14,6 +14,8 @@ use peet_core::{ConnectOptions, Session};
 use peet_proto::{Codec, InputEvent, MouseButton};
 use peet_tailscale::{LocalApi, PeerStatus, Status};
 
+mod mcp;
+
 #[derive(Debug, Parser)]
 #[command(name = "peet", version, about = "PeetConnect remote desktop CLI")]
 struct Cli {
@@ -137,6 +139,8 @@ enum Command {
         #[arg(long)]
         pin: Option<String>,
     },
+    /// Run a Model Context Protocol server on stdio so an agent can drive hosts as tools.
+    Mcp,
     /// Print protocol constants for this build.
     Version,
 }
@@ -466,6 +470,9 @@ async fn main() -> Result<()> {
                 eprintln!("sent {chord}");
             }
         }
+        Command::Mcp => {
+            mcp::serve().await?;
+        }
         Command::Version => {
             if cli.json {
                 print_json(&serde_json::json!({
@@ -492,7 +499,7 @@ async fn finish_input(session: &Session) {
 }
 
 /// Maps a monitor-relative (or absolute) point to host virtual-desktop coordinates.
-fn virtual_point(
+pub(crate) fn virtual_point(
     info: &peet_core::SessionInfo,
     monitor: Option<u32>,
     x: i32,
@@ -533,7 +540,7 @@ async fn open_session(host: &str, pin: Option<String>) -> Result<Session> {
         .with_context(|| format!("connecting to {host} ({addr})"))
 }
 
-async fn fetch_status(api: &LocalApi) -> Result<Status> {
+pub(crate) async fn fetch_status(api: &LocalApi) -> Result<Status> {
     let status = api
         .status()
         .await
@@ -589,7 +596,7 @@ fn print_peer_table(status: &Status, peers: &[&PeerStatus]) {
     }
 }
 
-fn peers_json(status: &Status, peers: &[&PeerStatus]) -> serde_json::Value {
+pub(crate) fn peers_json(status: &Status, peers: &[&PeerStatus]) -> serde_json::Value {
     serde_json::Value::Array(
         peers
             .iter()

@@ -17,7 +17,7 @@ Status: early development. See [docs/PLAN.md](docs/PLAN.md) for architecture and
 | `crates/peet-core` | Client core: connect, handshake, control, video events, screenshots. Shared by viewer, CLI and (later) MCP. |
 | `crates/peet-codec` | H.264 encode (Media Foundation hardware/software, openh264 fallback) and decode (Media Foundation + DXVA), GPU colour conversion. |
 | `crates/peet-input` | Synthesises mouse and keyboard input with `SendInput`; layout-independent key table. |
-| `bins/peet` | Command line. |
+| `bins/peet` | Command line, and the `mcp` subcommand: an MCP server exposing hosts as agent tools. |
 | `bins/peet-bench` | Capture and encode benchmarks. |
 | `bins/peet-host` | Host: serves monitors to authorised tailnet viewers; injects input; runs as a console process or a LocalSystem service. |
 | `bins/peet-viewer` | GPUI viewer: `--connect <host>` for a remote session, or a loopback test rig. |
@@ -82,10 +82,29 @@ cargo run --release -p peet -- click <host> 400 300          # move then left-cl
 cargo run --release -p peet -- type  <host> "hello world"    # Unicode text
 cargo run --release -p peet -- key   <host> ctrl+alt+delete  # a key chord
 cargo run --release -p peet -- scroll <host> --dy 3          # wheel notches
+cargo run --release -p peet -- clipboard <host>              # read the host clipboard
+cargo run --release -p peet -- clipboard <host> --set "hi"   # write the host clipboard
 ```
 
 Coordinates are relative to the chosen monitor (`--monitor`, default primary) unless
 `--absolute` is given.
+
+### Agent surface (MCP)
+
+`peet mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio, so
+an LLM agent can drive hosts as tools with no GUI. It keeps one QUIC session per host open across
+tool calls and reconnects lazily, so a run of clicks and screenshots reuses a single connection.
+
+```
+cargo run --release -p peet -- mcp
+```
+
+Register it with an MCP client by pointing the client at the `peet` binary with the `mcp`
+argument. The tools are `peet_peers`, `peet_monitors`, `peet_screenshot` (returns a PNG image),
+`peet_move`, `peet_click`, `peet_scroll`, `peet_type`, `peet_key`, `peet_clipboard_get` and
+`peet_clipboard_set`. Each takes the target `host` (and an optional `pin`); coordinates are
+monitor-relative unless `absolute` is set. For a newline, send `peet_key` with `enter` rather
+than a `\n` in `peet_type`.
 
 ### Unattended access (Windows service)
 

@@ -181,9 +181,28 @@ secure-desktop capture/injection and the session switch (need a locked machine),
 viewer's interactive input (the GPUI window cannot be focused from the tool session). Exit
 criterion — unattended control of a locked machine — is written but untested.
 
-**M5 — Agent surface.** Local control API, `peet` CLI (connect, screenshot, click, type, key,
-clipboard), headless viewer mode, MCP server. Exit: an agent can drive a remote session with
-no GUI. This can start in parallel with M4 since it sits on peet-core.
+**M5 — Agent surface.** Done 2026-11-13.
+
+Done: clipboard flows over the control stream — `SetClipboard`/`GetClipboard`/`ClipboardText`
+messages, `Control::set_clipboard`/`get_clipboard` in peet-core, host read/write of
+`CF_UNICODETEXT` on a blocking thread, and `peet clipboard <host> [--set <text>]`. The `peet mcp`
+subcommand runs a Model Context Protocol server on stdio (hand-rolled JSON-RPC 2.0, newline
+framed) exposing ten tools: `peet_peers`, `peet_monitors`, `peet_screenshot` (returns a PNG
+image content block), `peet_move`, `peet_click`, `peet_scroll`, `peet_type`, `peet_key`,
+`peet_clipboard_get`, `peet_clipboard_set`. The server is the local control API and the headless
+session store in one: it holds a live QUIC session per host across tool calls (a background task
+drains host events so the control reader never stalls) and reconnects lazily on failure. All of
+it sits on peet-core, so the CLI, GUI viewer and MCP behave identically.
+
+Verified against the dev box's own Tailscale IP: `initialize`/`tools/list`/`tools/call` all
+answer; `peet_screenshot` returns a decodable PNG; clipboard get/set round-trip the real Windows
+clipboard including Unicode; and a full headless input loop (click to focus Notepad, `ctrl+a`,
+`delete`, `peet_type`) landed the typed Unicode text in the window, confirmed by screenshot.
+
+Note: `peet_type` injects `\n` as a literal Unicode newline, which Notepad does not treat as
+Enter; agents send `peet_key enter` for a line break (same semantics as M4 text injection).
+
+Exit met: an agent can drive a remote session with no GUI.
 
 **M6 — Daily-driver UX.** Multi-monitor layout, clipboard, file transfer, connection list with
 favourites, tray app, settings, reconnect. Exit: replaces AnyDesk for personal use.
