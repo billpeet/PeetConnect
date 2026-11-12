@@ -22,9 +22,9 @@ pub use quinn;
 pub use stream::{FramedRecv, FramedSend};
 
 /// Idle time after which a connection is considered dead.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 /// Interval between QUIC keep-alive packets.
-pub const KEEP_ALIVE: Duration = Duration::from_secs(4);
+pub const KEEP_ALIVE: Duration = Duration::from_secs(2);
 
 /// Server name used in the TLS handshake. The viewer does not verify it; it only has to be a
 /// valid DNS name for rustls to accept the configuration.

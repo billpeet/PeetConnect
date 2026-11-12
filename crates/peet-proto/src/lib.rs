@@ -197,7 +197,8 @@ pub enum ControlMessage {
         request_id: u64,
     },
     /// Host's reply to [`ControlMessage::GetClipboard`]; `None` when the clipboard is empty
-    /// or holds no text.
+    /// or holds no text. With `request_id` 0 it is an unsolicited push: the host's clipboard
+    /// changed and this is its new text.
     ClipboardText {
         request_id: u64,
         text: Option<String>,

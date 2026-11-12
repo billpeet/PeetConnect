@@ -81,6 +81,8 @@ pub enum Event {
         bitrate_kbps: u32,
         skipped: u32,
     },
+    /// The host's clipboard changed to this text.
+    Clipboard(String),
     /// The connection ended. No more events follow.
     Closed(String),
 }
@@ -464,6 +466,14 @@ async fn control_reader(
                     }
                 }
                 ControlMessage::ClipboardText { request_id, text } => {
+                    if request_id == 0 {
+                        if let Some(text) = text {
+                            if events.send(Event::Clipboard(text)).await.is_err() {
+                                break "consumer gone".to_string();
+                            }
+                        }
+                        continue;
+                    }
                     let waiter = shared
                         .clipboard
                         .lock()

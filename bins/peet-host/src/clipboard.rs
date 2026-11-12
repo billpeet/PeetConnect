@@ -97,3 +97,11 @@ pub fn set_text(text: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// The system clipboard's change counter. Increments on every change by any process, so a
+/// watcher can poll it cheaply without opening the clipboard.
+pub fn sequence_number() -> u32 {
+    use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+    // SAFETY: no arguments, no preconditions.
+    unsafe { GetClipboardSequenceNumber() }
+}

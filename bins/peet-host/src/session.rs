@@ -155,6 +155,20 @@ async fn control_loop(
         session_id,
         state.config.follow_desktop,
     ));
+    // Clipboard sync: a watcher pushes local changes to the viewer; `last_set` remembers what
+    // the viewer last wrote so its own text is not echoed straight back.
+    let last_set: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    let watcher_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let tx = ctl_tx.clone();
+        let last_set = last_set.clone();
+        let stop = watcher_stop.clone();
+        std::thread::Builder::new()
+            .name(format!("clipboard-{}", session_id.0))
+            .spawn(move || clipboard_watcher(&tx, &last_set, &stop))
+            .context("spawning clipboard watcher")?;
+    }
+    let _stop_on_exit = StopOnDrop(watcher_stop);
 
     loop {
         tokio::select! {
@@ -214,7 +228,9 @@ async fn control_loop(
                         });
                     }
                     ControlMessage::SetClipboard { text } => {
+                        let last_set = last_set.clone();
                         tokio::task::spawn_blocking(move || {
+                            *last_set.lock().expect("last_set poisoned") = Some(text.clone());
                             if let Err(err) = crate::clipboard::set_text(&text) {
                                 tracing::debug!(%err, "set clipboard failed");
                             }
@@ -254,6 +270,50 @@ async fn control_loop(
     }
     drop(streams);
     Ok(())
+}
+
+/// Sets the flag when dropped, so the watcher thread exits with the control loop.
+struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Polls the clipboard sequence number and pushes new text to the viewer as an unsolicited
+/// `ClipboardText` (request id 0). Text the viewer itself just set is skipped.
+fn clipboard_watcher(
+    tx: &mpsc::Sender<ControlMessage>,
+    last_set: &std::sync::Mutex<Option<String>>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    let mut seen = crate::clipboard::sequence_number();
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(300));
+        let seq = crate::clipboard::sequence_number();
+        if seq == seen {
+            continue;
+        }
+        seen = seq;
+        let Ok(Some(text)) = crate::clipboard::get_text() else {
+            continue;
+        };
+        if last_set.lock().expect("last_set poisoned").as_deref() == Some(text.as_str()) {
+            continue;
+        }
+        tracing::debug!(
+            chars = text.chars().count(),
+            "clipboard changed; pushing to viewer"
+        );
+        let msg = ControlMessage::ClipboardText {
+            request_id: 0,
+            text: Some(text),
+        };
+        if tx.blocking_send(msg).is_err() {
+            break;
+        }
+    }
 }
 
 /// Input arrives on its own stream. Each stream gets a task that injects every event into the

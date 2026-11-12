@@ -5,6 +5,7 @@
 //! the DirectComposition presenter. The UI thread only reads [`RemoteShared`] and sends
 //! control messages through the session's [`Control`] handle.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,11 +59,35 @@ pub struct RemoteShared {
     pub status: Mutex<RemoteStatus>,
     pub cursor: Mutex<CursorOverlay>,
     pub control: Mutex<Option<Control>>,
+    /// Set by the UI to end the session for good (no reconnect).
+    pub quit: AtomicBool,
+    /// Bumped per connection so the decoder starts clean after a reconnect.
+    pub generation: AtomicU64,
+    /// Clipboard text the host pushed, waiting for the UI thread to write locally.
+    pub clipboard_in: Mutex<Option<String>>,
 }
 
 impl RemoteShared {
     pub fn status(&self) -> RemoteStatus {
         self.status.lock().expect("status poisoned").clone()
+    }
+
+    /// Ends the session and stops reconnecting.
+    pub fn quit(&self) {
+        self.quit.store(true, Ordering::Relaxed);
+    }
+
+    /// Sends local clipboard text to the host.
+    pub fn push_clipboard(&self, text: String) {
+        let control = self.control.lock().expect("control poisoned").clone();
+        if let Some(control) = control {
+            control.try_send(ControlMessage::SetClipboard { text });
+        }
+    }
+
+    /// Takes clipboard text the host pushed, if any.
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.clipboard_in.lock().expect("clipboard poisoned").take()
     }
 
     /// Forwards an input event to the host, if connected. Returns false if dropped.
@@ -139,22 +164,76 @@ pub fn run(config: Config) -> Result<()> {
                 shared.status.lock().expect("status poisoned").message = err.to_string();
             }
         })?;
-    let result = runtime.block_on(session(session_config, shared, frame_tx));
+    let result = runtime.block_on(session_loop(session_config, &shared, frame_tx));
     drop(runtime);
     let _ = decode_thread.join();
     result
 }
 
-async fn session(
+/// Why a session ended.
+enum SessionEnd {
+    /// The UI asked to stop; do not reconnect.
+    Quit,
+    /// The connection was lost; reconnect.
+    Lost(String),
+}
+
+/// Runs sessions back to back, reconnecting with backoff until the UI quits or the host
+/// rejects us outright (a wrong PIN will not fix itself).
+async fn session_loop(
     config: SessionConfig,
-    shared: Arc<RemoteShared>,
+    shared: &Arc<RemoteShared>,
     frames: mpsc::Sender<VideoFrame>,
 ) -> Result<()> {
-    set_message(&shared, format!("resolving {}", config.target));
+    let mut attempt: u32 = 0;
+    loop {
+        if shared.quit.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        shared.generation.fetch_add(1, Ordering::Relaxed);
+        match session(&config, shared, frames.clone()).await {
+            Ok(SessionEnd::Quit) => return Ok(()),
+            Ok(SessionEnd::Lost(reason)) => {
+                attempt = 0;
+                tracing::info!(%reason, "connection lost; reconnecting");
+            }
+            Err(err) => {
+                if let Some(peet_core::ConnectError::Rejected(_)) =
+                    err.downcast_ref::<peet_core::ConnectError>()
+                {
+                    return Err(err);
+                }
+                attempt += 1;
+                tracing::warn!(%err, attempt, "connect failed; retrying");
+            }
+        }
+        // 1 s, 2 s, 4 s, 8 s, then 10 s between attempts.
+        let delay =
+            Duration::from_secs(u64::from(1u32 << attempt.min(3))).min(Duration::from_secs(10));
+        set_message(
+            shared,
+            format!("reconnecting to {} in {}s", config.target, delay.as_secs()),
+        );
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if shared.quit.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+async fn session(
+    config: &SessionConfig,
+    shared: &Arc<RemoteShared>,
+    frames: mpsc::Sender<VideoFrame>,
+) -> Result<SessionEnd> {
+    set_message(shared, format!("resolving {}", config.target));
     let addr = peet_core::resolve(&config.target).await?;
-    set_message(&shared, format!("connecting to {addr}"));
+    set_message(shared, format!("connecting to {addr}"));
     let opts = ConnectOptions {
-        pin: config.pin,
+        pin: config.pin.clone(),
         ..ConnectOptions::default()
     };
     let session = peet_core::connect(addr, opts)
@@ -162,12 +241,12 @@ async fn session(
         .with_context(|| format!("connecting to {addr}"))?;
     let (info, control, mut events, guard) = session.split();
 
+    // After a reconnect, go back to the monitor the user was watching.
+    let wanted = shared.status().current.map(|m| m.0).or(config.monitor);
     let monitor = info
         .monitors
         .iter()
-        .find(|m| {
-            config.monitor.is_none_or(|id| m.id.0 == id) && (config.monitor.is_some() || m.primary)
-        })
+        .find(|m| wanted.is_none_or(|id| m.id.0 == id) && (wanted.is_some() || m.primary))
         .or(info.monitors.first())
         .map(|m| m.id)
         .context("host reports no monitors")?;
@@ -190,14 +269,15 @@ async fn session(
         .await?;
 
     let mut rtt_tick = tokio::time::interval(Duration::from_secs(1));
-    let reason = loop {
+    let mut quit_tick = tokio::time::interval(Duration::from_millis(100));
+    let end = loop {
         tokio::select! {
             event = events.recv() => {
-                let Some(event) = event else { break "session ended".to_string() };
+                let Some(event) = event else { break SessionEnd::Lost("session ended".to_string()) };
                 match event {
                     Event::Video(frame) => {
                         if frames.send(frame).await.is_err() {
-                            break "decoder stopped".to_string();
+                            break SessionEnd::Quit; // the decoder died; reconnecting cannot help
                         }
                     }
                     Event::Cursor(update) => {
@@ -226,24 +306,37 @@ async fn session(
                             status.skipped = skipped;
                         }
                     }
-                    Event::Closed(reason) => break reason,
+                    Event::Clipboard(text) => {
+                        tracing::info!(chars = text.chars().count(), "clipboard received from host");
+                        *shared.clipboard_in.lock().expect("clipboard poisoned") = Some(text);
+                    }
+                    Event::Closed(reason) => break SessionEnd::Lost(reason),
                 }
             }
             _ = rtt_tick.tick() => {
                 let rtt = control.rtt().map(|d| d.as_secs_f64() * 1e3);
                 shared.status.lock().expect("status poisoned").rtt_ms = rtt;
             }
+            _ = quit_tick.tick() => {
+                if shared.quit.load(Ordering::Relaxed) {
+                    break SessionEnd::Quit;
+                }
+            }
         }
     };
     guard.close("viewer closed");
+    let reason = match &end {
+        SessionEnd::Quit => "disconnected".to_string(),
+        SessionEnd::Lost(reason) => format!("disconnected: {reason}"),
+    };
     {
         let mut status = shared.status.lock().expect("status poisoned");
         status.connected = false;
-        status.message = format!("disconnected: {reason}");
+        status.message.clone_from(&reason);
     }
     *shared.control.lock().expect("control poisoned") = None;
     tracing::info!(%reason, "session over");
-    Ok(())
+    Ok(end)
 }
 
 fn set_message(shared: &RemoteShared, message: String) {
@@ -287,12 +380,19 @@ fn decode_loop(
     let mut period = Instant::now();
     let mut frames_in_period: u32 = 0;
     let mut decode_time = Duration::ZERO;
+    let mut generation = shared.generation.load(Ordering::Relaxed);
 
     while let Some(frame) = frames.blocking_recv() {
         let current = shared.status.lock().expect("status poisoned").current;
         if current.is_some() && current != Some(frame.monitor) {
             // Tail of a stream we switched away from.
             continue;
+        }
+        // A reconnect restarts sequence numbers and may change the stream, so start clean.
+        let now_generation = shared.generation.load(Ordering::Relaxed);
+        if now_generation != generation {
+            generation = now_generation;
+            decoder = None;
         }
         let size = (frame.width, frame.height);
         // Compare against the size we created the decoder with, not the decoder's own

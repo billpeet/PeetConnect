@@ -90,8 +90,8 @@ mod app {
 
     use anyhow::{Context as _, Result};
     use gpui::{
-        canvas, div, img, prelude::*, px, rgb, size, App, Application, Bounds, Context,
-        FocusHandle, ImageSource, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
+        canvas, div, img, prelude::*, px, rgb, size, App, Application, Bounds, ClipboardItem,
+        Context, FocusHandle, ImageSource, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
         MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, Pixels, Point, RenderImage,
         ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window, WindowBackgroundAppearance,
         WindowBounds, WindowOptions,
@@ -204,7 +204,16 @@ mod app {
             Some(target) => format!("PeetConnect - {target}"),
             None => "PeetConnect viewer (loopback)".to_string(),
         };
+        let shared_for_close = shared.clone();
         Application::new().run(move |cx: &mut App| {
+            // Closing the last window ends the session (no reconnect) and exits.
+            cx.on_window_closed(move |cx| {
+                if cx.windows().is_empty() {
+                    shared_for_close.quit();
+                    cx.quit();
+                }
+            })
+            .detach();
             let bounds = Bounds::centered(None, size(px(1280.0), px(760.0)), cx);
             cx.open_window(
                 WindowOptions {
@@ -245,6 +254,9 @@ mod app {
         latency_n: u32,
         since: Instant,
         status: String,
+        /// Last clipboard text seen locally, so we only push changes and never echo.
+        last_clipboard: Option<String>,
+        clipboard_checked: Instant,
     }
 
     impl Viewer {
@@ -272,6 +284,40 @@ mod app {
                 latency_n: 0,
                 since: Instant::now(),
                 status: "starting".into(),
+                last_clipboard: None,
+                clipboard_checked: Instant::now(),
+            }
+        }
+
+        /// Two-way clipboard sync. Text the host pushed is written locally; local changes
+        /// (checked a few times a second while the window is active) are pushed to the host.
+        /// `last_clipboard` tracks both directions so nothing bounces back and forth.
+        fn sync_clipboard(&mut self, window: &Window, cx: &mut Context<Self>) {
+            if let Some(text) = self.shared.take_clipboard() {
+                if self.last_clipboard.as_deref() != Some(text.as_str()) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    self.last_clipboard = Some(text);
+                }
+            }
+            if self.clipboard_checked.elapsed() < Duration::from_millis(400) {
+                return;
+            }
+            self.clipboard_checked = Instant::now();
+            if !window.is_window_active() || !self.shared.status().connected {
+                return;
+            }
+            let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                return;
+            };
+            if self.last_clipboard.as_deref() == Some(text.as_str()) {
+                return;
+            }
+            // The first read after connecting only primes the baseline; pushing whatever
+            // happened to be on the clipboard would surprise the user.
+            let prime = self.last_clipboard.is_none();
+            self.last_clipboard = Some(text.clone());
+            if !prime {
+                self.shared.push_clipboard(text);
             }
         }
 
@@ -625,6 +671,9 @@ mod app {
             if !self.focused_once {
                 self.focused_once = true;
                 window.focus(&self.focus);
+            }
+            if self.mode == Mode::Remote {
+                self.sync_clipboard(window, cx);
             }
             self.update_status();
 
