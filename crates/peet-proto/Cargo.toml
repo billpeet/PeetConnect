@@ -1,0 +1,16 @@
+[package]
+name = "peet-proto"
+description = "PeetConnect wire protocol: message types, framing and codec negotiation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

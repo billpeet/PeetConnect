@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/billpeet/peetconnect"
+rust-version = "1.85"
+
+[workspace.dependencies]
+peet-proto = { path = "crates/peet-proto" }
+peet-tailscale = { path = "crates/peet-tailscale" }
+
+anyhow = "1.0"
+bytes = "1.12"
+clap = { version = "4.6", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1.12", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+postcard = { version = "1.1", features = ["use-std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+# Product and API names (PeetConnect, LocalAPI, tailscaled) are prose, not code.
+doc_markdown = "allow"
+match_wildcard_for_single_variants = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
