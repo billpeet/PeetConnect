@@ -4,6 +4,9 @@
 //! seconds, writes raw Annex B H.264 per monitor, and prints timing statistics. Animated
 //! windows are opened on each monitor so there is always something changing.
 
+// On other platforms the binary is a stub, so nothing below main is reachable.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]

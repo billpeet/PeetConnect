@@ -3,6 +3,9 @@
 //! Milestone 3 build: runs as a plain user process in the interactive session. The Windows
 //! service, secure-desktop capture and input injection arrive in milestone 4.
 
+// On other platforms the binary is a stub, so nothing below main is reachable.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::net::IpAddr;
 use std::path::PathBuf;
 

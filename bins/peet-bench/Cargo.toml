@@ -10,12 +10,13 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-peet-capture.workspace = true
-peet-codec.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# Windows-only: the binary is a stub elsewhere and these would be dead weight.
 [target.'cfg(windows)'.dependencies]
+peet-capture.workspace = true
+peet-codec.workspace = true
 windows.workspace = true
 
 [lints]

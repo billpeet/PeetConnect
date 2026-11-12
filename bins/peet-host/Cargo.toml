@@ -8,18 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-peet-capture.workspace = true
-peet-input.workspace = true
-peet-codec.workspace = true
 peet-proto.workspace = true
-peet-tailscale.workspace = true
-peet-transport.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
 gethostname.workspace = true
-image.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -27,7 +21,14 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# Windows-only: the binary is a stub elsewhere and these would be dead weight.
 [target.'cfg(windows)'.dependencies]
+peet-capture.workspace = true
+peet-input.workspace = true
+peet-codec.workspace = true
+peet-tailscale.workspace = true
+peet-transport.workspace = true
+image.workspace = true
 windows.workspace = true
 
 [lints]

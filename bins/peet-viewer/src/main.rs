@@ -5,6 +5,9 @@
 //! to a session. `--loopback` runs the milestone 2 rig (local capture, encode, decode and
 //! present), still the quickest way to measure the pipeline on one machine.
 
+// On other platforms the binary is a stub, so nothing below main is reachable.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use clap::{Parser, ValueEnum};
 
 #[derive(Debug, Parser)]
