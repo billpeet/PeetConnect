@@ -1,0 +1,23 @@
+[package]
+name = "peet-transport"
+description = "QUIC transport for PeetConnect: endpoint setup, TLS, tagged framed streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peet-proto.workspace = true
+
+bytes.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

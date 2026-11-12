@@ -266,6 +266,18 @@ impl MfH264Encoder {
         })
     }
 
+    /// Changes the target bitrate mid-stream. Hardware encoders apply it from the next
+    /// frame; the software MFT may take a GOP to settle.
+    pub fn set_bitrate(&mut self, bitrate_kbps: u32) {
+        if let Some(api) = &self.codec_api {
+            set_codec_prop(
+                api,
+                &CODECAPI_AVEncCommonMeanBitRate,
+                &variant_u32(bitrate_kbps.saturating_mul(1000)),
+            );
+        }
+    }
+
     /// True when [`encode_texture`](Self::encode_texture) is available.
     pub fn accepts_textures(&self) -> bool {
         self.d3d.is_some()

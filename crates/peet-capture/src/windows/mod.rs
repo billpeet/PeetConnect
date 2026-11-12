@@ -1,11 +1,13 @@
 //! Windows backend: DXGI Desktop Duplication on a Direct3D 11 device.
 
+mod cursor;
 mod device;
 mod dxgi;
 mod gdi;
 mod monitors;
 mod source;
 
+pub use cursor::CursorTracker;
 pub use device::D3dDevice;
 pub use dxgi::DxgiCapturer;
 pub use gdi::GdiCapturer;

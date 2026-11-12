@@ -12,21 +12,30 @@ rust-version = "1.88"
 [workspace.dependencies]
 peet-capture = { path = "crates/peet-capture" }
 peet-codec = { path = "crates/peet-codec" }
+peet-core = { path = "crates/peet-core" }
 peet-proto = { path = "crates/peet-proto" }
 peet-tailscale = { path = "crates/peet-tailscale" }
+peet-transport = { path = "crates/peet-transport" }
 
 anyhow = "1.0"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
+dirs = "7"
+gethostname = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 http-body-util = "0.1"
 hyper = { version = "1.12", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 openh264 = "0.9"
 postcard = { version = "1.1", features = ["use-std"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows = { version = "0.62", features = [

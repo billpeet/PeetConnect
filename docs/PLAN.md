@@ -136,11 +136,29 @@ the video thread owns a composition target (`topmost = false`; GPUI holds the to
 a visual and a flip-model swap chain sized to the bounds. Multi-monitor views are more
 visuals on the same target.
 
-**M3 — Network.** (next) QUIC over Tailscale, whois auth + allow-list, codec negotiation, cursor,
-adaptive bitrate, keyframe recovery. Host runs as a plain user process (`--console`). Exit:
-remote view between two tailnet machines.
+**M3 — Network. Done 2026-11-12.** `peet-transport` (quinn 0.11, rustls/ring, self-signed
+cert per host start, any-cert client verifier because Tailscale is the trust layer, one tag
+byte per stream, length-prefixed postcard frames). `peet-core` (client session: handshake,
+control writer/reader, ping/RTT, per-stream video readers, screenshot request/response,
+lazily opened input stream). `peet-host` (whois authorisation with allow-list by user, tag,
+node or whole tailnet, optional PIN, per-monitor capture+encode thread feeding a
+unidirectional QUIC stream, skip-capture-when-queue-full with AIMD bitrate control via
+`ICodecAPI` mid-stream, keyframe on request, cursor position+shape out of band, PNG
+screenshots on a blocking thread, TOML config). Viewer `--connect` mode decodes on its own
+thread, requests a keyframe on sequence gaps or decode errors, draws the remote cursor as a
+GPUI image mapped through the presenter's letterbox, and switches monitors on keys 1-9.
+`peet monitors` and `peet screenshot` exercise the same core headlessly.
 
-**M4 — Input + service.** SendInput injection, Windows service as SYSTEM, per-session helper,
+Verified on one machine by connecting to its own Tailscale IP (tailscaled answers `whois`
+for the local node): 1080p at 58 fps viewer-side, ~5 Mbit/s, 1.1 ms decode, under 1 ms RTT.
+Loopback (127.0.0.1) is rejected unless `--allow-local`. Not yet verified: a second tailnet
+machine, real packet loss, and the keyboard monitor switch (UI automation could not focus
+the GPUI window; the code path is the same `SetStream` the CLI exercises).
+
+Interesting: DXGI duplication delivered frames to `peet-host` on the dev box at 54 fps, where
+`peet-bench` saw none in M1. The watchdog fallback stays.
+
+**M4 — Input + service.** (next) SendInput injection, Windows service as SYSTEM, per-session helper,
 secure desktop (lock screen, UAC) capture and input, session switch on logon/logoff, installer
 script. Exit: unattended control of a locked machine.
 

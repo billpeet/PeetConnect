@@ -1,12 +1,17 @@
 //! `peet`: the PeetConnect command line.
 //!
-//! Milestone 0 exposes Tailscale discovery and identity. Session commands (connect,
-//! screenshot, input) arrive with the client core in later milestones.
+//! Tailscale discovery and identity, plus headless session commands built on `peet-core`:
+//! list a host's monitors and take screenshots without a GUI. Input and the full agent
+//! surface arrive in milestone 5.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use peet_core::{ConnectOptions, Session};
+use peet_proto::Codec;
 use peet_tailscale::{LocalApi, PeerStatus, Status};
 
 #[derive(Debug, Parser)]
@@ -34,6 +39,29 @@ enum Command {
     Whois {
         /// Tailscale IP of the peer, e.g. 100.101.102.103.
         addr: IpAddr,
+    },
+    /// List the monitors of a PeetConnect host.
+    Monitors {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Capture a monitor of a PeetConnect host to a PNG file.
+    Screenshot {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        /// Monitor ID (see `monitors`); default is the primary.
+        #[arg(long)]
+        monitor: Option<u32>,
+        /// Downscale so the image is at most this wide.
+        #[arg(long)]
+        max_width: Option<u32>,
+        /// Output file; `-` writes PNG bytes to stdout.
+        #[arg(short, long, default_value = "screenshot.png")]
+        output: PathBuf,
+        #[arg(long)]
+        pin: Option<String>,
     },
     /// Print protocol constants for this build.
     Version,
@@ -117,6 +145,87 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Monitors { host, pin } => {
+            let session = open_session(&host, pin).await?;
+            let info = session.info();
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "host_name": info.host_name,
+                    "session_id": info.session_id.0,
+                    "codec": format!("{:?}", info.codec),
+                    "monitors": info.monitors.iter().map(|m| serde_json::json!({
+                        "id": m.id.0, "name": m.name, "x": m.bounds.x, "y": m.bounds.y,
+                        "width": m.bounds.width, "height": m.bounds.height,
+                        "scale_percent": m.scale_percent, "primary": m.primary,
+                    })).collect::<Vec<_>>(),
+                }))?;
+            } else {
+                println!("{} ({} monitors)", info.host_name, info.monitors.len());
+                for m in &info.monitors {
+                    println!(
+                        "  {:>4}  {:<14} {}x{} at {},{}  {}%{}",
+                        m.id.0,
+                        m.name,
+                        m.bounds.width,
+                        m.bounds.height,
+                        m.bounds.x,
+                        m.bounds.y,
+                        m.scale_percent,
+                        if m.primary { "  primary" } else { "" }
+                    );
+                }
+            }
+            session.close("done");
+        }
+        Command::Screenshot {
+            host,
+            monitor,
+            max_width,
+            output,
+            pin,
+        } => {
+            let session = open_session(&host, pin).await?;
+            let info = session.info();
+            let target = match monitor {
+                Some(id) => info
+                    .monitors
+                    .iter()
+                    .find(|m| m.id.0 == id)
+                    .with_context(|| format!("host has no monitor {id}"))?,
+                None => info
+                    .monitors
+                    .iter()
+                    .find(|m| m.primary)
+                    .or(info.monitors.first())
+                    .context("host reports no monitors")?,
+            };
+            let image = session
+                .control()
+                .screenshot(target.id, Codec::Png, max_width, Duration::from_secs(15))
+                .await?;
+            session.close("done");
+            if output.as_os_str() == "-" {
+                use std::io::Write as _;
+                std::io::stdout().write_all(&image.data)?;
+            } else {
+                std::fs::write(&output, &image.data)
+                    .with_context(|| format!("writing {}", output.display()))?;
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "path": output, "width": image.width, "height": image.height,
+                        "bytes": image.data.len(), "monitor": target.id.0,
+                    }))?;
+                } else {
+                    eprintln!(
+                        "{}x{} PNG, {} bytes -> {}",
+                        image.width,
+                        image.height,
+                        image.data.len(),
+                        output.display()
+                    );
+                }
+            }
+        }
         Command::Version => {
             if cli.json {
                 print_json(&serde_json::json!({
@@ -133,6 +242,21 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn open_session(host: &str, pin: Option<String>) -> Result<Session> {
+    let addr = peet_core::resolve(host).await?;
+    let opts = ConnectOptions {
+        client_name: format!(
+            "peet CLI on {}",
+            gethostname::gethostname().to_string_lossy()
+        ),
+        pin,
+        ..ConnectOptions::default()
+    };
+    peet_core::connect(addr, opts)
+        .await
+        .with_context(|| format!("connecting to {host} ({addr})"))
 }
 
 async fn fetch_status(api: &LocalApi) -> Result<Status> {

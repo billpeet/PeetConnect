@@ -32,6 +32,37 @@ pub const DEFAULT_PORT: u16 = 7735;
 /// ALPN identifier used during the QUIC/TLS handshake.
 pub const ALPN: &[u8] = b"peetconnect/1";
 
+/// Role of a QUIC stream. The opening side writes one tag byte before any frames so the
+/// receiver knows how to interpret the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum StreamKind {
+    Control = 0,
+    Video = 1,
+    Input = 2,
+    Clipboard = 3,
+    File = 4,
+    Audio = 5,
+}
+
+impl StreamKind {
+    pub fn tag(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        Some(match tag {
+            0 => Self::Control,
+            1 => Self::Video,
+            2 => Self::Input,
+            3 => Self::Clipboard,
+            4 => Self::File,
+            5 => Self::Audio,
+            _ => return None,
+        })
+    }
+}
+
 /// Identifies a monitor on the host. Stable for the lifetime of a session unless the host
 /// sends [`ControlMessage::MonitorsChanged`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -159,6 +190,14 @@ pub enum ControlMessage {
     ScreenshotResult(ScreenshotResult),
     Disconnect {
         reason: String,
+    },
+    /// Host-side stream statistics, sent about once a second per active monitor.
+    StreamStats {
+        monitor: MonitorId,
+        fps: u16,
+        bitrate_kbps: u32,
+        /// Captured frames the host skipped because the network was not keeping up.
+        skipped: u32,
     },
 }
 

@@ -1,0 +1,20 @@
+[package]
+name = "peet-core"
+description = "PeetConnect client core: connect to a host, drive the session, receive video and events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peet-proto.workspace = true
+peet-transport.workspace = true
+
+gethostname.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -8,11 +8,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+peet-core.workspace = true
 peet-proto.workspace = true
 peet-tailscale.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
+gethostname.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

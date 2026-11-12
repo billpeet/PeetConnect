@@ -109,6 +109,74 @@ pub struct CursorShapeData {
     pub data: Vec<u8>,
 }
 
+impl CursorShapeData {
+    /// Converts any shape kind to premultiplied BGRA8 suitable for drawing with alpha
+    /// blending, as [`peet_proto::CursorShape`] carries it. XOR regions, which cannot be
+    /// drawn without the pixels underneath, become mid-grey.
+    pub fn to_proto(&self) -> peet_proto::CursorShape {
+        let (width, height, bgra) = match self.kind {
+            CursorShapeKind::Color => {
+                let mut out = Vec::with_capacity(self.width as usize * self.height as usize * 4);
+                for row in self.rows(self.height) {
+                    out.extend_from_slice(&row[..self.width as usize * 4]);
+                }
+                (self.width, self.height, out)
+            }
+            CursorShapeKind::MaskedColor => {
+                let mut out = Vec::with_capacity(self.width as usize * self.height as usize * 4);
+                for row in self.rows(self.height) {
+                    for px in row[..self.width as usize * 4].as_chunks::<4>().0 {
+                        let xor = px[3] == 0xFF;
+                        let colour_is_black = px[0] == 0 && px[1] == 0 && px[2] == 0;
+                        if xor && colour_is_black {
+                            out.extend_from_slice(&[0, 0, 0, 0]);
+                        } else if xor {
+                            out.extend_from_slice(&[128, 128, 128, 255]);
+                        } else {
+                            out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                        }
+                    }
+                }
+                (self.width, self.height, out)
+            }
+            CursorShapeKind::Monochrome => {
+                let height = self.height / 2;
+                let pitch = self.pitch as usize;
+                let mut out = Vec::with_capacity(self.width as usize * height as usize * 4);
+                for y in 0..height as usize {
+                    let and_row = &self.data[y * pitch..];
+                    let xor_row = &self.data[(y + height as usize) * pitch..];
+                    for x in 0..self.width as usize {
+                        let bit = 0x80 >> (x % 8);
+                        let and = and_row[x / 8] & bit != 0;
+                        let xor = xor_row[x / 8] & bit != 0;
+                        out.extend_from_slice(&match (and, xor) {
+                            (false, false) => [0, 0, 0, 255],
+                            (false, true) => [255, 255, 255, 255],
+                            (true, false) => [0, 0, 0, 0],
+                            (true, true) => [128, 128, 128, 255],
+                        });
+                    }
+                }
+                (self.width, height, out)
+            }
+        };
+        peet_proto::CursorShape {
+            width,
+            height,
+            hotspot_x: self.hotspot_x,
+            hotspot_y: self.hotspot_y,
+            bgra,
+        }
+    }
+
+    fn rows(&self, count: u32) -> impl Iterator<Item = &[u8]> {
+        self.data
+            .chunks(self.pitch.max(1) as usize)
+            .take(count as usize)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorShapeKind {
     /// 1 bpp AND mask followed by 1 bpp XOR mask; `height` covers both halves.
