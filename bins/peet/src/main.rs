@@ -118,6 +118,16 @@ enum Command {
         #[arg(long)]
         pin: Option<String>,
     },
+    /// Read or write the host clipboard. With --set, writes it; otherwise reads it.
+    Clipboard {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        /// Text to write to the host clipboard. Omit to read it instead.
+        #[arg(long)]
+        set: Option<String>,
+        #[arg(long)]
+        pin: Option<String>,
+    },
     /// Press a key chord such as `enter`, `ctrl+c` or `ctrl+alt+delete`.
     Key {
         /// Host name, MagicDNS name or IP, with optional :port.
@@ -395,6 +405,31 @@ async fn main() -> Result<()> {
                 print_json(&serde_json::json!({ "typed": text }))?;
             } else {
                 eprintln!("typed {} characters", text.chars().count());
+            }
+        }
+        Command::Clipboard { host, set, pin } => {
+            let session = open_session(&host, pin).await?;
+            let control = session.control();
+            if let Some(text) = set {
+                control.set_clipboard(text.clone()).await?;
+                // Give the host a moment to apply it before we close the connection.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                session.close("done");
+                if cli.json {
+                    print_json(&serde_json::json!({ "set": text }))?;
+                } else {
+                    eprintln!("set host clipboard ({} characters)", text.chars().count());
+                }
+            } else {
+                let text = control.get_clipboard(Duration::from_secs(10)).await?;
+                session.close("done");
+                if cli.json {
+                    print_json(&serde_json::json!({ "text": text }))?;
+                } else if let Some(text) = text {
+                    print!("{text}");
+                } else {
+                    eprintln!("(host clipboard is empty or holds no text)");
+                }
             }
         }
         Command::Key { host, chord, pin } => {

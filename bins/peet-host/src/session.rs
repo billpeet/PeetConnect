@@ -111,7 +111,7 @@ async fn handshake(state: &HostState, connection: &quinn::Connection) -> Result<
         codec: Codec::H264,
         capabilities: Capabilities {
             codecs: vec![Codec::H264],
-            features: vec![Feature::Screenshot],
+            features: vec![Feature::Screenshot, Feature::Clipboard],
         },
         monitors: monitors.iter().map(MonitorDesc::to_proto).collect(),
     })
@@ -213,6 +213,23 @@ async fn control_loop(
                             }));
                         });
                     }
+                    ControlMessage::SetClipboard { text } => {
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(err) = crate::clipboard::set_text(&text) {
+                                tracing::debug!(%err, "set clipboard failed");
+                            }
+                        });
+                    }
+                    ControlMessage::GetClipboard { request_id } => {
+                        let tx = ctl_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let text = crate::clipboard::get_text().unwrap_or_else(|err| {
+                                tracing::debug!(%err, "get clipboard failed");
+                                None
+                            });
+                            let _ = tx.blocking_send(ControlMessage::ClipboardText { request_id, text });
+                        });
+                    }
                     ControlMessage::Disconnect { reason } => {
                         tracing::info!(session = session_id.0, %reason, "viewer disconnected");
                         break;
@@ -220,6 +237,7 @@ async fn control_loop(
                     ControlMessage::Cursor(_)
                     | ControlMessage::MonitorsChanged { .. }
                     | ControlMessage::ScreenshotResult(_)
+                    | ControlMessage::ClipboardText { .. }
                     | ControlMessage::StreamStats { .. } => {
                         tracing::debug!(session = session_id.0, ?msg, "ignoring host-only message from viewer");
                     }

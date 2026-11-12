@@ -53,7 +53,7 @@ impl Default for ConnectOptions {
             client_name: gethostname::gethostname().to_string_lossy().into_owned(),
             pin: None,
             codecs: vec![Codec::H264],
-            features: vec![Feature::Screenshot],
+            features: vec![Feature::Screenshot, Feature::Clipboard],
         }
     }
 }
@@ -265,6 +265,7 @@ impl Drop for SessionGuard {
 struct Shared {
     next_request: AtomicU64,
     screenshots: Mutex<HashMap<u64, oneshot::Sender<ScreenshotResult>>>,
+    clipboard: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
     pings: Mutex<HashMap<u64, Instant>>,
     rtt: Mutex<Option<Duration>>,
 }
@@ -362,6 +363,35 @@ impl Control {
         }
     }
 
+    /// Sets the host's clipboard to `text`. Fire-and-forget: the host has no reply to send.
+    pub async fn set_clipboard(&self, text: String) -> Result<(), ConnectError> {
+        self.send(ControlMessage::SetClipboard { text }).await
+    }
+
+    /// Reads the host's clipboard. `Ok(None)` means the clipboard is empty or holds no text.
+    pub async fn get_clipboard(&self, timeout: Duration) -> Result<Option<String>, ConnectError> {
+        let request_id = self.shared.next_request.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = oneshot::channel();
+        self.shared
+            .clipboard
+            .lock()
+            .expect("clipboard map poisoned")
+            .insert(request_id, tx);
+        self.send(ControlMessage::GetClipboard { request_id })
+            .await?;
+        let result = tokio::time::timeout(timeout, rx).await;
+        self.shared
+            .clipboard
+            .lock()
+            .expect("clipboard map poisoned")
+            .remove(&request_id);
+        match result {
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(_)) => Err(ConnectError::Handshake("session closed".into())),
+            Err(_) => Err(ConnectError::Handshake("clipboard read timed out".into())),
+        }
+    }
+
     /// Latest measured round-trip time, if a pong has arrived.
     pub fn rtt(&self) -> Option<Duration> {
         *self.shared.rtt.lock().expect("rtt poisoned")
@@ -433,10 +463,22 @@ async fn control_reader(
                         break "consumer gone".to_string();
                     }
                 }
+                ControlMessage::ClipboardText { request_id, text } => {
+                    let waiter = shared
+                        .clipboard
+                        .lock()
+                        .expect("clipboard map poisoned")
+                        .remove(&request_id);
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(text);
+                    }
+                }
                 ControlMessage::Disconnect { reason } => break reason,
                 ControlMessage::SetStream { .. }
                 | ControlMessage::RequestKeyframe { .. }
-                | ControlMessage::Screenshot(_) => {
+                | ControlMessage::Screenshot(_)
+                | ControlMessage::SetClipboard { .. }
+                | ControlMessage::GetClipboard { .. } => {
                     tracing::debug!(?msg, "ignoring client-only message from host");
                 }
             },

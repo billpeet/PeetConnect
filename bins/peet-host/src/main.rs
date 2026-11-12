@@ -105,6 +105,8 @@ fn main() -> anyhow::Result<()> {
 #[cfg(windows)]
 mod auth;
 #[cfg(windows)]
+mod clipboard;
+#[cfg(windows)]
 mod desktop;
 #[cfg(windows)]
 mod screenshot;

@@ -188,6 +188,20 @@ pub enum ControlMessage {
     Cursor(CursorUpdate),
     Screenshot(ScreenshotRequest),
     ScreenshotResult(ScreenshotResult),
+    /// Viewer sets the host's clipboard to this text.
+    SetClipboard {
+        text: String,
+    },
+    /// Viewer asks for the host's current clipboard text.
+    GetClipboard {
+        request_id: u64,
+    },
+    /// Host's reply to [`ControlMessage::GetClipboard`]; `None` when the clipboard is empty
+    /// or holds no text.
+    ClipboardText {
+        request_id: u64,
+        text: Option<String>,
+    },
     Disconnect {
         reason: String,
     },
