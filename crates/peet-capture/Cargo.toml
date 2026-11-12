@@ -1,0 +1,19 @@
+[package]
+name = "peet-capture"
+description = "Screen capture: monitor enumeration and per-monitor frame acquisition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peet-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[lints]
+workspace = true

@@ -7,9 +7,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/billpeet/peetconnect"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
+peet-capture = { path = "crates/peet-capture" }
+peet-codec = { path = "crates/peet-codec" }
 peet-proto = { path = "crates/peet-proto" }
 peet-tailscale = { path = "crates/peet-tailscale" }
 
@@ -19,6 +21,7 @@ clap = { version = "4.6", features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1.12", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+openh264 = "0.9"
 postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -26,6 +29,22 @@ thiserror = "2.0"
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Ole",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_UI_HiDpi",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
@@ -40,6 +59,16 @@ must_use_candidate = "allow"
 # Product and API names (PeetConnect, LocalAPI, tailscaled) are prose, not code.
 doc_markdown = "allow"
 match_wildcard_for_single_variants = "allow"
+# `&mut x` passed to Win32 out-pointers is clearer than `&raw mut x` everywhere.
+borrow_as_ptr = "allow"
+# Pixel maths and Win32 interop cast constantly; the clamps make truncation intentional.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+too_many_lines = "allow"
+missing_panics_doc = "allow"
+many_single_char_names = "allow"
 
 [profile.release]
 lto = "thin"

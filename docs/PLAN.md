@@ -89,10 +89,31 @@ Notes from M0: on Windows the LocalAPI named pipe must be opened with `SECURITY_
 or tailscaled returns 401 (tokio's default is identification-only). `whois` returns 404 for
 non-tailnet addresses; the host treats that as "not authorised".
 
-**M1 — Capture + encode, offline.** DXGI duplication of all monitors, MF H.264 encode, write to a
-file; openh264 fallback; benchmarks (CPU %, frame time, 4K60). Exit: a playable .h264 per monitor.
+**M1 — Capture + encode, offline. Done 2026-11-12.** `peet-capture` (DXGI Desktop Duplication
+via `DuplicateOutput1`, GDI fallback with GPU upload, monitor enumeration with DPI/adapter),
+`peet-codec` (Media Foundation H.264 hardware/software with async-MFT event loop and D3D11
+zero-copy via video-processor BGRA→NV12, openh264 fallback, CPU NV12 conversion),
+`peet-bench` (per-monitor capture+encode benchmark with animated stimulus windows, raw
+duplication probe, encoder listing). Exit met: playable .h264 per monitor, verified by decoding.
 
-**M2 — Loopback viewer + GPUI spike.** Decode and present in a GPUI window over an in-process
+Results on the dev box (RTX 4070 SUPER, 1080p per monitor, release build):
+
+| Path | capture | encode | notes |
+|---|---|---|---|
+| GDI → GPU upload → NVENC (zero-copy NV12) | ~14–17 ms | ~3.5 ms | 2 monitors in parallel at 30+ fps, 1.5% total CPU |
+| GDI → CPU NV12 → Microsoft H264 MFT | ~20 ms | ~6 ms | software encoder is fine for 1080p |
+| GDI → CPU NV12 → NVENC (system memory) | ~20 ms | ~7 ms | |
+| GDI → openh264 | ~20 ms | ~35 ms | no NASM; fallback only |
+
+**Open issue from M1:** on the dev box DXGI Desktop Duplication delivers *no frames at all*
+(every `AcquireNextFrame` times out, including the first), for both our code and an
+independent implementation (Python `dxcam`). GDI works, so this is machine/driver/OS state
+(Windows 11 26H2 build 26300, NVIDIA 32.0.16.1692), not a code bug. Consequences: the host
+needs a capture watchdog that falls back to GDI (the bench already does this), and we should
+evaluate Windows.Graphics.Capture as a third backend. DXGI timings are therefore still
+unmeasured here; expect ~1 ms per frame when it works.
+
+**M2 — Loopback viewer + GPUI spike.** (next) Decode and present in a GPUI window over an in-process
 channel. Measure present path at 4K60. Decide: GPUI image element vs D3D11 child HWND. Exit:
 60 fps local mirror with latency figure.
 
@@ -121,4 +142,7 @@ Android viewer, signing + auto-update, distribution.
 - DPI and resolution changes mid-session (DXGI returns ACCESS_LOST; reinit, send new monitor layout).
 - Keyboard: send scancodes not VKs where possible; handle layout mismatch and stuck modifiers on focus loss.
 - GPUI on Windows: API churn and sparse docs. Pin a version; isolate UI from peet-core.
+- DXGI duplication can silently deliver nothing (seen on the dev box). Always keep a GDI
+  fallback behind a watchdog, and consider Windows.Graphics.Capture.
+- Hardware MFTs are per-vendor; on multi-GPU machines try each until one accepts the device.
 - openh264 ships as a Cisco binary for the patent licence; bundling must follow their terms.
