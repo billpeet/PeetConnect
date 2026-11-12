@@ -96,6 +96,9 @@ pub struct HostConfig {
     pub fps: u32,
     pub max_bitrate_kbps: u32,
     pub capture: String,
+    /// True when running as the service worker: capture and input threads follow the active
+    /// input desktop so they keep working across the secure desktop.
+    pub follow_desktop: bool,
 }
 
 impl HostConfig {
@@ -131,6 +134,7 @@ impl HostConfig {
                 .clone()
                 .or(file.video.capture)
                 .unwrap_or_else(|| "auto".into()),
+            follow_desktop: cli.session_worker,
         }
     }
 

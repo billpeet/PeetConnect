@@ -150,7 +150,11 @@ async fn control_loop(
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMessage>(256);
     let mut streams: HashMap<MonitorId, MonitorStream> = HashMap::new();
     let session_start = Instant::now();
-    tokio::spawn(accept_input_streams(connection.clone(), session_id));
+    tokio::spawn(accept_input_streams(
+        connection.clone(),
+        session_id,
+        state.config.follow_desktop,
+    ));
 
     loop {
         tokio::select! {
@@ -178,6 +182,7 @@ async fn control_loop(
                             fps: max_fps.map_or(state.config.fps, |f| u32::from(f).min(state.config.fps)).max(1),
                             bitrate_kbps: max_bitrate_kbps.map_or(state.config.max_bitrate_kbps, |b| b.min(state.config.max_bitrate_kbps)).max(200),
                             backend: parse_backend(&state.config.capture),
+                            follow_desktop: state.config.follow_desktop,
                         };
                         if streams.get(&monitor).is_some_and(|s| s.params.fps == params.fps && s.params.bitrate_kbps == params.bitrate_kbps) {
                             streams[&monitor].request_keyframe();
@@ -237,11 +242,15 @@ async fn control_loop(
 /// interactive desktop via `SendInput`. Injection runs on a dedicated blocking thread so a slow
 /// FFI call never stalls the async runtime, and so every event for a stream keeps the same
 /// desktop attachment.
-async fn accept_input_streams(connection: quinn::Connection, session_id: SessionId) {
+async fn accept_input_streams(
+    connection: quinn::Connection,
+    session_id: SessionId,
+    follow_desktop: bool,
+) {
     loop {
         match peet_transport::accept_uni(&connection).await {
             Ok((StreamKind::Input, recv)) => {
-                tokio::spawn(inject_input_stream(recv, session_id));
+                tokio::spawn(inject_input_stream(recv, session_id, follow_desktop));
             }
             Ok((kind, _)) => tracing::debug!(session = session_id.0, ?kind, "unexpected stream"),
             Err(TransportError::Connection(_)) => break,
@@ -254,11 +263,16 @@ async fn accept_input_streams(connection: quinn::Connection, session_id: Session
 }
 
 /// Reads input events off one stream and feeds them to a blocking injector thread.
-async fn inject_input_stream(mut recv: FramedRecv, session_id: SessionId) {
+async fn inject_input_stream(mut recv: FramedRecv, session_id: SessionId, follow_desktop: bool) {
     // A bounded channel bridges async reads to the synchronous SendInput thread. Input is tiny,
     // so a shallow queue keeps latency low while absorbing short stalls.
     let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent>(256);
     let worker = std::thread::spawn(move || {
+        // SendInput targets this thread's desktop, so follow the input desktop when running as
+        // the service worker. The guard is held for the thread's lifetime.
+        let _desktop = follow_desktop
+            .then(crate::desktop::attach_input_desktop)
+            .flatten();
         let mut injector = peet_input::Injector::new();
         let mut count: u64 = 0;
         while let Ok(event) = rx.recv() {

@@ -158,9 +158,28 @@ the GPUI window; the code path is the same `SetStream` the CLI exercises).
 Interesting: DXGI duplication delivered frames to `peet-host` on the dev box at 54 fps, where
 `peet-bench` saw none in M1. The watchdog fallback stays.
 
-**M4 — Input + service.** (next) SendInput injection, Windows service as SYSTEM, per-session helper,
-secure desktop (lock screen, UAC) capture and input, session switch on logon/logoff, installer
-script. Exit: unattended control of a locked machine.
+**M4 — Input + service.** (in progress)
+
+Done: `peet-input` injects mouse move/button/wheel, scancode keys and Unicode text via
+`SendInput`, with a layout-independent key-name table. The host injects every event from the
+input stream on a dedicated blocking thread. `peet-core` gained an input flush barrier so
+one-shot senders can be sure events reached the wire before closing. The CLI gained
+`move`/`click`/`scroll`/`type`/`key` for headless control. The viewer forwards mouse and keyboard,
+mapping pointer positions through the inverse of the presenter letterbox; `Ctrl+Alt+1..9` switch
+monitors locally, all other keys reach the host. The Windows service (`--service`,
+`--install`/`--uninstall`, `scripts/install-service.ps1`) runs as LocalSystem and launches a
+worker (`--session-worker`) into the active console session via `CreateProcessAsUser`, respawning
+on session change; worker capture and input threads attach to the active input desktop.
+
+Verified: injection end to end against the dev box's own Tailscale IP — a synthetic click
+dismissed a firewall dialog and typing/key chords landed in Notepad. Unicode text is paced per
+character because the Win11 Notepad RichEdit coalesces a fast `VK_PACKET` burst into a repeat of
+the last character. The viewer still renders at 60 fps with input wired.
+
+Not verified: the service at runtime (the dev box has no administrator rights to install one),
+secure-desktop capture/injection and the session switch (need a locked machine), and the
+viewer's interactive input (the GPUI window cannot be focused from the tool session). Exit
+criterion — unattended control of a locked machine — is written but untested.
 
 **M5 — Agent surface.** Local control API, `peet` CLI (connect, screenshot, click, type, key,
 clipboard), headless viewer mode, MCP server. Exit: an agent can drive a remote session with

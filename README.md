@@ -16,9 +16,10 @@ Status: early development. See [docs/PLAN.md](docs/PLAN.md) for architecture and
 | `crates/peet-transport` | QUIC (quinn) endpoints, self-signed TLS, tagged framed streams. |
 | `crates/peet-core` | Client core: connect, handshake, control, video events, screenshots. Shared by viewer, CLI and (later) MCP. |
 | `crates/peet-codec` | H.264 encode (Media Foundation hardware/software, openh264 fallback) and decode (Media Foundation + DXVA), GPU colour conversion. |
+| `crates/peet-input` | Synthesises mouse and keyboard input with `SendInput`; layout-independent key table. |
 | `bins/peet` | Command line. |
 | `bins/peet-bench` | Capture and encode benchmarks. |
-| `bins/peet-host` | Host: serves monitors to authorised tailnet viewers. Plain user process for now. |
+| `bins/peet-host` | Host: serves monitors to authorised tailnet viewers; injects input; runs as a console process or a LocalSystem service. |
 | `bins/peet-viewer` | GPUI viewer: `--connect <host>` for a remote session, or a loopback test rig. |
 
 ## Try it
@@ -84,8 +85,25 @@ cargo run --release -p peet -- scroll <host> --dy 3          # wheel notches
 ```
 
 Coordinates are relative to the chosen monitor (`--monitor`, default primary) unless
-`--absolute` is given. The service that injects into the lock screen and other secure desktops
-is still to come; today the host runs as a normal process in the interactive session.
+`--absolute` is given.
+
+### Unattended access (Windows service)
+
+For a machine you want to reach when nobody is signed in, install the host as a service. It runs
+as LocalSystem and launches a worker into the active console session, which is what lets it
+capture and inject across sign-in, the lock screen and UAC prompts.
+
+```
+scripts\install-service.ps1 -AllowUser you@example.com      # installs and starts (prompts for admin)
+scripts\install-service.ps1 -Uninstall                      # stops and removes
+```
+
+The allow rules are baked into the service command line; reinstall to change them. Under the
+hood the script runs `peet-host --install <flags>` elevated and `sc start PeetConnect`.
+
+The service path is implemented but unverified: the development machine has no administrator
+rights to install a service, and the secure-desktop and session-switch behaviour needs a locked
+machine to exercise. The interactive host (`--console`, the default) is the tested mode.
 
 ## Development
 

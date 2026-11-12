@@ -12,6 +12,7 @@ mod config;
 
 #[derive(Debug, Parser)]
 #[command(name = "peet-host", version, about = "PeetConnect host")]
+#[allow(clippy::struct_excessive_bools)] // a CLI naturally has many on/off flags
 pub struct Cli {
     /// Configuration file (default: %APPDATA%\PeetConnect\host.toml).
     #[arg(long)]
@@ -51,9 +52,21 @@ pub struct Cli {
     /// Capture backend: auto, dxgi or gdi.
     #[arg(long)]
     capture: Option<String>,
-    /// Run in the foreground attached to this console (the only mode so far).
+    /// Run in the foreground attached to this console.
     #[arg(long)]
     console: bool,
+    /// Install the Windows service (requires an elevated prompt). Other flags are baked in.
+    #[arg(long)]
+    install: bool,
+    /// Remove the Windows service (requires an elevated prompt).
+    #[arg(long)]
+    uninstall: bool,
+    /// Run as the Windows service. Only valid when launched by the Service Control Manager.
+    #[arg(long)]
+    service: bool,
+    /// Internal: the per-session worker the service launches into the interactive desktop.
+    #[arg(long, hide = true)]
+    session_worker: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -71,6 +84,15 @@ fn main() -> anyhow::Result<()> {
     let config = config::HostConfig::resolve(file, &cli);
     #[cfg(windows)]
     {
+        if cli.install {
+            return service::install(&cli);
+        }
+        if cli.uninstall {
+            return service::uninstall();
+        }
+        if cli.service {
+            return service::run_service();
+        }
         host::run(config)
     }
     #[cfg(not(windows))]
@@ -83,7 +105,11 @@ fn main() -> anyhow::Result<()> {
 #[cfg(windows)]
 mod auth;
 #[cfg(windows)]
+mod desktop;
+#[cfg(windows)]
 mod screenshot;
+#[cfg(windows)]
+mod service;
 #[cfg(windows)]
 mod session;
 #[cfg(windows)]

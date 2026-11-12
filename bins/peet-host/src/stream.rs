@@ -27,6 +27,9 @@ pub struct StreamParams {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub backend: Backend,
+    /// Follow the active input desktop (service worker mode) so capture survives a desktop
+    /// switch to the secure desktop.
+    pub follow_desktop: bool,
 }
 
 /// Handle to a running stream. Dropping it stops the thread and finishes the QUIC stream.
@@ -135,6 +138,13 @@ struct Worker {
 
 impl Worker {
     fn run(self) -> Result<()> {
+        // In service worker mode, sit on the active input desktop so capture keeps producing
+        // frames across a switch to the secure desktop. Held for the thread's lifetime.
+        let _desktop = self
+            .params
+            .follow_desktop
+            .then(crate::desktop::attach_input_desktop)
+            .flatten();
         let device = D3dDevice::for_adapter(self.monitor.adapter_index)?;
         let mut source = FrameSource::new(
             device.clone(),
