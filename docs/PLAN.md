@@ -215,7 +215,7 @@ number and pushes changes as an unsolicited `ClipboardText`; the viewer writes t
 pushes its own changes while active; one last-seen value guards both directions against echo.
 *Home screen* — live tailnet device list (3 s refresh via LocalAPI), favourites (star toggle),
 recents, an address box, click-to-connect; `Ctrl+Alt+D` or a status-bar button disconnects back
-to it. Settings persist in `%APPDATA%\PeetConnectiewer.toml` (fps, bitrate, favourites,
+to it. Settings persist in `%APPDATA%\PeetConnect\viewer.toml` (fps, bitrate, favourites,
 recents). `--loopback` now selects the M2 test rig; no arguments opens the home screen.
 *Multi-monitor layout* — `Ctrl+Alt+0` streams every monitor at once, laid out as on the host
 (uniformly scaled, centred); `Ctrl+Alt+<n>` goes back to one. The presenter keeps its single
@@ -247,9 +247,18 @@ came out of it: QUIC path-MTU probing produced WSAEMSGSIZE warnings on both ends
 Tailscale's MTU is 1280; probing is now disabled and the 1200-byte initial MTU is kept.
 Observed but not yet tuned: the 4K stream ran at ~19 fps host-side on that machine.
 
-Not done: file transfer, host tray app, a settings UI (values are file-only), PIN entry on the
-home screen, per-monitor bitrate budgeting in all-monitors mode (each stream keeps the full
-cap). Exit — replaces AnyDesk for personal use — is close for the viewer side; the service still
+*Polish (2026-11-13)* — a connecting/reconnecting card over the video with a cancel button
+(Escape also cancels while not yet connected); host rejections rendered in plain words with the
+reject reason carried in `RemoteStatus`, and a PIN box on the home screen that a `PinRequired` or
+`PinIncorrect` answer activates (Tab switches boxes, Enter retries); frame-rate and bitrate preset
+chips on the home screen, persisted; a session bar with clickable monitor pills, "all",
+fullscreen and disconnect; `Ctrl+Alt+F` fullscreen with the bar hidden until the pointer touches
+the top edge; the window title names the host. Verified on the dev box by driving the viewer
+through the host: PIN rejection, PIN retry, pills, fullscreen reveal, host kill showing
+"Reconnecting" and recovering, disconnect to home.
+
+Not done: file transfer, host tray app, per-monitor bitrate budgeting in all-monitors mode (each
+stream keeps the full cap), remembering a PIN per host. Exit — replaces AnyDesk for personal use — is close for the viewer side; the service still
 needs an administrator to verify unattended use (neither test machine's user is one).
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),

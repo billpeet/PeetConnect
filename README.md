@@ -72,18 +72,21 @@ cargo run --release -p peet -- screenshot <host> -o shot.png        # headless: 
 ```
 
 The home screen lists the devices on your tailnet (live, with online state), your favourites
-(star a row) and recent connections; click a row or type an address and press Enter. Those
-and the default fps/bitrate persist in `%APPDATA%\PeetConnectiewer.toml`. Hosts that need a
-PIN are reached with `--connect <host> --pin <pin>` for now.
+(star a row) and recent connections; click a row or type an address and press Enter. A PIN box
+sits next to the address (Tab switches between them); a host that wants a PIN sends you back to
+it with a plain message. Frame-rate and bitrate presets below the address apply to the next
+session. Those and the lists persist in `%APPDATA%\PeetConnect\viewer.toml`.
 
-In a session the viewer forwards mouse and keyboard to the host. `Ctrl+Alt+1`..`9` switch
-monitors locally, `Ctrl+Alt+0` shows every monitor at once laid out as on the host, and
-`Ctrl+Alt+D` (or the status-bar button) disconnects back to the home screen; every other key
-reaches the remote machine. The host injects input with `SendInput`
-and so drives whatever has focus in the interactive session. The clipboard syncs both ways
-(text only): copy on either side and paste on the other. If the connection drops, the viewer
-reconnects on its own with backoff and returns to the monitor you were watching; a host that
-never answered is reported back on the home screen instead.
+In a session the viewer forwards mouse and keyboard to the host. The bar at the top shows the
+host, the stream statistics and buttons for each monitor, all monitors, fullscreen and
+disconnect; the same from the keyboard is `Ctrl+Alt+1`..`9`, `Ctrl+Alt+0`, `Ctrl+Alt+F` and
+`Ctrl+Alt+D`. In fullscreen the bar hides and comes back when the pointer touches the top edge.
+Every other key reaches the remote machine. The host injects input with `SendInput` and so drives
+whatever has focus in the interactive session. The clipboard syncs both ways (text only): copy on
+either side and paste on the other. While connecting, and after a drop, a card over the video says
+what is happening and offers to cancel; the viewer reconnects on its own with backoff and returns
+to the monitor you were watching. A host that never answered or rejected you is reported back on
+the home screen in plain words.
 
 The CLI drives input headlessly, which is how an agent clicks and types without a window:
 

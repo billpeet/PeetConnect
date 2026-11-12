@@ -97,14 +97,14 @@ mod app {
 
     use anyhow::{Context as _, Result};
     use gpui::{
-        canvas, div, img, prelude::*, px, rgb, size, App, Application, Bounds, ClipboardItem,
-        Context, FocusHandle, FontWeight, ImageSource, KeyDownEvent, Keystroke, MouseButton,
-        MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, Pixels,
-        Point, RenderImage, ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window,
+        canvas, div, img, prelude::*, px, rgb, rgba, size, App, Application, Bounds, ClickEvent,
+        ClipboardItem, Context, FocusHandle, FontWeight, ImageSource, KeyDownEvent, Keystroke,
+        MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit,
+        Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window,
         WindowBackgroundAppearance, WindowBounds, WindowOptions,
     };
     use peet_capture::windows::Backend;
-    use peet_proto::MonitorId;
+    use peet_proto::{MonitorId, RejectReason};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     use crate::home::{self, Discovery, ViewerConfig};
@@ -135,6 +135,20 @@ mod app {
         Home,
         Session,
     }
+
+    /// Which home-screen text box takes typing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Field {
+        Address,
+        Pin,
+    }
+
+    /// Bitrate presets offered on the home screen, in kbit/s.
+    const BITRATE_PRESETS: [u32; 5] = [4000, 8000, 12_000, 20_000, 30_000];
+    /// Frame-rate presets offered on the home screen.
+    const FPS_PRESETS: [u32; 2] = [30, 60];
+    /// The in-session bar stays visible this close to the top edge while fullscreen.
+    const REVEAL_BAR_PX: f32 = 40.0;
 
     /// Settings a session is started with.
     #[derive(Debug, Clone)]
@@ -272,6 +286,17 @@ mod app {
         discovery: Arc<Mutex<Discovery>>,
         /// Address typed on the home screen.
         address: String,
+        /// PIN typed on the home screen (empty: use the `--pin` flag, if any).
+        pin: String,
+        field: Field,
+        /// The last host asked for a PIN; the home screen points at the PIN box.
+        needs_pin: bool,
+        /// Current or last session: (target, display name).
+        session_target: (String, String),
+        /// Window title as last set.
+        title: String,
+        /// Pointer y in the window, to reveal the bar in fullscreen.
+        pointer_y: f32,
         /// Last session's failure, shown on the home screen.
         last_error: Option<String>,
         /// A connect requested before the window handle was known: (target, display name).
@@ -316,6 +341,12 @@ mod app {
                 defaults,
                 discovery: home::start_discovery(),
                 address: String::new(),
+                pin: String::new(),
+                field: Field::Address,
+                needs_pin: false,
+                session_target: (String::new(), String::new()),
+                title: String::new(),
+                pointer_y: 0.0,
                 last_error: None,
                 pending,
                 focus: cx.focus_handle(),
@@ -349,13 +380,19 @@ mod app {
             self.shared = shared.clone();
             self.last_error = None;
             self.last_clipboard = None;
+            self.needs_pin = false;
+            self.session_target = (target.clone(), name.clone());
             self.config.record_recent(&target, &name);
             self.screen = Screen::Session;
             self.status = "connecting".into();
             let config = remote::Config {
                 session: remote::SessionConfig {
                     target,
-                    pin: self.defaults.pin.clone(),
+                    pin: if self.pin.is_empty() {
+                        self.defaults.pin.clone()
+                    } else {
+                        Some(self.pin.clone())
+                    },
                     monitor: self.defaults.monitor,
                     fps: self.defaults.fps,
                     bitrate_kbps: self.defaults.bitrate_kbps,
@@ -370,9 +407,11 @@ mod app {
                 .spawn(move || {
                     if let Err(err) = remote::run(config) {
                         tracing::error!(%err, "session failed");
+                        let (message, rejected) = remote::describe_error(&err);
                         let mut status = shared.status.lock().expect("status poisoned");
                         status.connected = false;
-                        status.message = format!("{err:#}");
+                        status.message = message;
+                        status.rejected = rejected;
                     }
                     shared.finished.store(true, Ordering::Relaxed);
                 });
@@ -394,8 +433,21 @@ mod app {
                 return;
             }
             let status = self.shared.status();
+            let (target, name) = self.session_target.clone();
             if status.message != "disconnected" && !status.message.is_empty() {
-                self.last_error = Some(status.message);
+                self.last_error = Some(format!("{name}: {}", status.message));
+            }
+            if let Some(reason @ (RejectReason::PinRequired | RejectReason::PinIncorrect)) =
+                status.rejected
+            {
+                // Put the host back in the address box and point at the PIN box, so a
+                // corrected PIN plus Enter retries.
+                if reason == RejectReason::PinIncorrect {
+                    self.pin.clear();
+                }
+                self.address = target;
+                self.field = Field::Pin;
+                self.needs_pin = true;
             }
             self.screen = Screen::Home;
             self.status = String::new();
@@ -494,7 +546,7 @@ mod app {
                             String::new()
                         };
                         format!(
-                            "{}  |  {monitor}  |  {}x{}  |  {:.0} fps (host {})  |  {} kbit/s  |  decode {:.2} ms{rtt}{skipped}  |  ctrl+alt+1-{} monitor, ctrl+alt+0 all, ctrl+alt+d disconnect",
+                            "{}  |  {monitor}  |  {}x{}  |  {:.0} fps (host {})  |  {} kbit/s  |  decode {:.2} ms{rtt}{skipped}",
                             s.host_name,
                             s.frame_size.0,
                             s.frame_size.1,
@@ -502,7 +554,6 @@ mod app {
                             s.host_fps,
                             s.kbps,
                             s.decode_ms,
-                            s.monitors.len().min(9),
                         )
                     } else if s.message.is_empty() {
                         "connecting".to_string()
@@ -550,11 +601,21 @@ mod app {
                 self.on_home_key(ks, cx);
                 return;
             }
+            // Escape while still connecting cancels; once connected every key is the host's.
+            if ks.key == "escape" && !self.shared.status().connected {
+                self.disconnect();
+                return;
+            }
             // Ctrl+Alt+<digit> switches the monitor locally instead of reaching the host, so
-            // bare digits still type normally on the remote machine. Ctrl+Alt+D disconnects.
+            // bare digits still type normally on the remote machine. Ctrl+Alt+D disconnects,
+            // Ctrl+Alt+F toggles fullscreen.
             if m.control && m.alt {
                 if ks.key == "d" {
                     self.disconnect();
+                    return;
+                }
+                if ks.key == "f" {
+                    window.toggle_fullscreen();
                     return;
                 }
                 if ks.key == "0" {
@@ -578,40 +639,70 @@ mod app {
             self.forward_key(ks);
         }
 
-        /// The home screen's only text field: the address box.
+        /// Typing on the home screen edits the active text box (address or PIN); Tab switches
+        /// between them and Enter connects.
         fn on_home_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
             let m = ks.modifiers;
             match ks.key.as_str() {
-                "enter" => {
-                    let target = self.address.trim().to_string();
-                    if !target.is_empty() {
-                        self.connect(target.clone(), target);
-                    }
+                "enter" => self.connect_typed(),
+                "tab" => {
+                    self.field = match self.field {
+                        Field::Address => Field::Pin,
+                        Field::Pin => Field::Address,
+                    };
                 }
                 "backspace" => {
+                    let field = self.field_mut();
                     if m.control {
-                        self.address.clear();
+                        field.clear();
                     } else {
-                        self.address.pop();
+                        field.pop();
                     }
                 }
-                "escape" => self.address.clear(),
+                "escape" => self.field_mut().clear(),
                 "v" if m.control => {
                     if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                        self.address.push_str(text.trim());
+                        self.field_mut().push_str(text.trim());
                     }
                 }
                 _ => {
                     if !m.control && !m.alt && !m.platform {
                         if let Some(ch) = &ks.key_char {
                             if !ch.chars().any(char::is_control) {
-                                self.address.push_str(ch);
+                                self.field_mut().push_str(ch);
                             }
                         }
                     }
                 }
             }
             cx.notify();
+        }
+
+        fn field_mut(&mut self) -> &mut String {
+            match self.field {
+                Field::Address => &mut self.address,
+                Field::Pin => &mut self.pin,
+            }
+        }
+
+        /// Connects to whatever is in the address box.
+        fn connect_typed(&mut self) {
+            let target = self.address.trim().to_string();
+            if !target.is_empty() {
+                self.connect(target.clone(), target);
+            }
+        }
+
+        fn set_fps(&mut self, fps: u32) {
+            self.defaults.fps = fps;
+            self.config.fps = fps;
+            self.config.save();
+        }
+
+        fn set_bitrate(&mut self, kbps: u32) {
+            self.defaults.bitrate_kbps = kbps;
+            self.config.bitrate_kbps = kbps;
+            self.config.save();
         }
 
         /// Sends a keystroke to the host as scancodes, wrapping the key in whatever modifiers
@@ -871,6 +962,133 @@ mod app {
                 .into_any_element()
         }
 
+        /// A home-screen text box. Typing goes to whichever box is active; clicking one
+        /// activates it. The PIN box shows dots and turns red when the host asked for a PIN.
+        fn text_box(
+            &self,
+            id: &'static str,
+            field: Field,
+            placeholder: &'static str,
+            cx: &mut Context<Self>,
+        ) -> gpui::AnyElement {
+            let active = self.field == field;
+            let value = match field {
+                Field::Address => &self.address,
+                Field::Pin => &self.pin,
+            };
+            let shown = if field == Field::Pin {
+                "•".repeat(value.chars().count())
+            } else {
+                value.clone()
+            };
+            let caret = if active { "▏" } else { "" };
+            let content = if value.is_empty() {
+                div()
+                    .text_color(rgb(0x6a7080))
+                    .child(format!("{caret}{placeholder}"))
+            } else {
+                div()
+                    .text_color(rgb(0xf0f0f0))
+                    .child(format!("{shown}{caret}"))
+            };
+            let border = if active {
+                0x4c7dff
+            } else if field == Field::Pin && self.needs_pin {
+                0xff7b72
+            } else {
+                0x343a46
+            };
+            div()
+                .id(id)
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(0x1c2028))
+                .border_1()
+                .border_color(rgb(border))
+                .cursor_text()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.field = field;
+                    cx.notify();
+                }))
+                .child(content)
+                .into_any_element()
+        }
+
+        /// Frame-rate and bitrate presets; a click applies to the next session and persists.
+        fn settings_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+            let mut row = div()
+                .mt_3()
+                .px_1()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap_2()
+                .text_xs()
+                .text_color(rgb(0x8a909c))
+                .child("frame rate");
+            for (i, &fps) in FPS_PRESETS.iter().enumerate() {
+                row = row.child(Self::chip(
+                    ("fps", i),
+                    format!("{fps}"),
+                    self.defaults.fps == fps,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_fps(fps);
+                        cx.notify();
+                    }),
+                ));
+            }
+            row = row.child(div().w(px(10.0))).child("bitrate");
+            for (i, &kbps) in BITRATE_PRESETS.iter().enumerate() {
+                row = row.child(Self::chip(
+                    ("kbps", i),
+                    format!("{} Mbit/s", kbps / 1000),
+                    self.defaults.bitrate_kbps == kbps,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_bitrate(kbps);
+                        cx.notify();
+                    }),
+                ));
+            }
+            row.into_any_element()
+        }
+
+        /// A small clickable pill, highlighted when selected.
+        fn chip(
+            id: (&'static str, usize),
+            label: String,
+            selected: bool,
+            on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        ) -> gpui::AnyElement {
+            let (bg, fg) = if selected {
+                (0x2f4f9e, 0xffffff)
+            } else {
+                (0x1c2028, 0x9aa0ac)
+            };
+            div()
+                .id(id)
+                .px_2()
+                .py(px(2.0))
+                .rounded_md()
+                .bg(rgb(bg))
+                .text_color(rgb(fg))
+                .cursor_pointer()
+                .hover(move |s| {
+                    if selected {
+                        s
+                    } else {
+                        s.bg(rgb(0x2a2f3a)).text_color(rgb(0xffffff))
+                    }
+                })
+                .on_click(on_click)
+                .child(label)
+                .into_any_element()
+        }
+
+        fn track_pointer(&mut self, event: &MouseMoveEvent, _: &mut Window, _: &mut Context<Self>) {
+            self.pointer_y = f32::from(event.position.y);
+        }
+
         fn section(title: &'static str) -> gpui::Div {
             div()
                 .mt_4()
@@ -944,15 +1162,14 @@ mod app {
                 })
                 .collect();
 
-            let address = if self.address.is_empty() {
-                div()
-                    .text_color(rgb(0x6a7080))
-                    .child("type a MagicDNS name or Tailscale IP, then Enter")
-            } else {
-                div()
-                    .text_color(rgb(0xf0f0f0))
-                    .child(format!("{}▏", self.address))
-            };
+            let address_box = self.text_box(
+                "address",
+                Field::Address,
+                "MagicDNS name or Tailscale IP, then Enter",
+                cx,
+            );
+            let pin_box = self.text_box("pin", Field::Pin, "PIN", cx);
+            let settings = self.settings_row(cx);
             let mut column = div()
                 .flex()
                 .flex_col()
@@ -968,14 +1185,12 @@ mod app {
                 )
                 .child(
                     div()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x1c2028))
-                        .border_1()
-                        .border_color(rgb(0x343a46))
-                        .child(address),
-                );
+                        .flex()
+                        .gap_2()
+                        .child(div().flex_1().child(address_box))
+                        .child(div().w(px(150.0)).child(pin_box)),
+                )
+                .child(settings);
             if let Some(err) = &self.last_error {
                 column = column.child(
                     div()
@@ -1014,6 +1229,19 @@ mod app {
             } else {
                 column = column.children(peer_rows);
             }
+
+            column = column.child(
+                div()
+                    .mt_6()
+                    .px_3()
+                    .text_xs()
+                    .text_color(rgb(0x5c6370))
+                    .child(
+                        "In a session: Ctrl+Alt+1..9 one monitor  ·  Ctrl+Alt+0 all monitors  ·  \
+                         Ctrl+Alt+F fullscreen  ·  Ctrl+Alt+D disconnect  ·  clipboard text syncs \
+                         both ways",
+                    ),
+            );
 
             div()
                 .id("home")
@@ -1082,6 +1310,16 @@ mod app {
                 }
             }
             self.update_status();
+            if self.mode == Mode::Remote {
+                let wanted = match self.screen {
+                    Screen::Home => "PeetConnect".to_string(),
+                    Screen::Session => format!("{} — PeetConnect", self.session_target.1),
+                };
+                if wanted != self.title {
+                    window.set_window_title(&wanted);
+                    self.title = wanted;
+                }
+            }
 
             let root = div()
                 .size_full()
@@ -1089,7 +1327,8 @@ mod app {
                 .flex_col()
                 .text_color(rgb(0xdddddd))
                 .track_focus(&self.focus)
-                .on_key_down(cx.listener(Self::on_key));
+                .on_key_down(cx.listener(Self::on_key))
+                .on_mouse_move(cx.listener(Self::track_pointer));
 
             if self.mode == Mode::Remote && self.screen == Screen::Home {
                 return root.child(self.render_home(cx));
@@ -1139,29 +1378,106 @@ mod app {
             } else {
                 root.bg(rgb(0x101010))
             };
+            let session_status = in_session.then(|| self.shared.status());
+            let connected = session_status.as_ref().is_some_and(|s| s.connected);
+            let fullscreen = window.is_fullscreen();
+            // Fullscreen hides the bar once connected; it comes back near the top edge.
+            let show_bar =
+                !in_session || !fullscreen || !connected || self.pointer_y < REVEAL_BAR_PX;
             let mut bar = div()
                 .h(px(26.0))
                 .px_2()
                 .flex()
                 .items_center()
-                .gap_3()
+                .gap_1()
                 .text_sm()
                 .bg(rgb(0x101010))
                 .child(div().flex_1().child(self.status.clone()));
-            if in_session {
-                bar = bar.child(
-                    div()
-                        .id("disconnect")
-                        .px_2()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_color(rgb(0xaaaaaa))
-                        .hover(|s| s.bg(rgb(0x333333)).text_color(rgb(0xffffff)))
-                        .on_click(cx.listener(|this, _, _, _| this.disconnect()))
-                        .child("disconnect"),
-                );
+            if let Some(s) = &session_status {
+                if s.connected && s.monitors.len() > 1 {
+                    for (i, m) in s.monitors.iter().take(9).enumerate() {
+                        let id = m.id;
+                        bar = bar.child(Self::chip(
+                            ("mon", i),
+                            format!("{}", i + 1),
+                            !s.all_monitors && s.current == Some(id),
+                            cx.listener(move |this, _, _, _| this.select_monitor(id)),
+                        ));
+                    }
+                    bar = bar
+                        .child(Self::chip(
+                            ("mon", 99),
+                            "all".into(),
+                            s.all_monitors,
+                            cx.listener(|this, _, _, _| this.shared.select_all()),
+                        ))
+                        .child(div().w(px(8.0)));
+                }
+                bar = bar
+                    .child(Self::chip(
+                        ("bar", 0),
+                        if fullscreen {
+                            "exit fullscreen"
+                        } else {
+                            "fullscreen"
+                        }
+                        .into(),
+                        false,
+                        |_, window, _| window.toggle_fullscreen(),
+                    ))
+                    .child(Self::chip(
+                        ("bar", 1),
+                        "disconnect".into(),
+                        false,
+                        cx.listener(|this, _, _, _| this.disconnect()),
+                    ));
             }
-            root.child(bar).child({
+            // While (re)connecting, a card over the (frozen or empty) video says so and offers
+            // a way out.
+            let overlay = session_status.filter(|s| !s.connected).map(|s| {
+                let name = &self.session_target.1;
+                let heading = if s.reconnecting {
+                    format!("Reconnecting to {name}")
+                } else {
+                    format!("Connecting to {name}")
+                };
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x0000_0099))
+                    .child(
+                        div()
+                            .px_6()
+                            .py_4()
+                            .rounded_lg()
+                            .bg(rgb(0x1c2028))
+                            .border_1()
+                            .border_color(rgb(0x343a46))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xf0f0f0))
+                                    .child(heading),
+                            )
+                            .child(div().text_sm().text_color(rgb(0x8a909c)).child(s.message))
+                            .child(Self::chip(
+                                ("overlay", 0),
+                                "cancel".into(),
+                                false,
+                                cx.listener(|this, _, _, _| this.disconnect()),
+                            )),
+                    )
+            });
+            let root = if show_bar { root.child(bar) } else { root };
+            root.child({
                 let mut area = div().flex_1().min_h_0().relative();
                 if in_session {
                     area = area
@@ -1179,7 +1495,7 @@ mod app {
                             .on_mouse_up(button, cx.listener(Self::on_mouse_up));
                     }
                 }
-                area.child(content).children(cursor)
+                area.child(content).children(cursor).children(overlay)
             })
         }
     }

@@ -17,7 +17,9 @@ use image::{Frame, ImageBuffer};
 use peet_capture::windows::D3dDevice;
 use peet_codec::windows::MfH264Decoder;
 use peet_core::{ConnectOptions, Control, Event};
-use peet_proto::{ControlMessage, CursorShape, InputEvent, MonitorId, MonitorInfo, VideoFrame};
+use peet_proto::{
+    ControlMessage, CursorShape, InputEvent, MonitorId, MonitorInfo, RejectReason, VideoFrame,
+};
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HWND;
@@ -41,6 +43,10 @@ pub struct RemoteStatus {
     pub rtt_ms: Option<f64>,
     pub connected: bool,
     pub message: String,
+    /// Set when the host turned us away, so the UI can react (ask for a PIN, say).
+    pub rejected: Option<RejectReason>,
+    /// A session that once worked was lost and is being re-established.
+    pub reconnecting: bool,
 }
 
 /// Remote cursor, drawn by GPUI over the video.
@@ -243,6 +249,7 @@ async fn session_loop(
             Ok(SessionEnd::Lost(reason)) => {
                 ever_connected = true;
                 attempt = 0;
+                shared.status.lock().expect("status poisoned").reconnecting = true;
                 tracing::info!(%reason, "connection lost; reconnecting");
             }
             Err(err) => {
@@ -315,6 +322,7 @@ async fn session(
         status.monitors.clone_from(&info.monitors);
         status.current = Some(monitor);
         status.connected = true;
+        status.reconnecting = false;
         status.message = String::new();
     }
     *shared.control.lock().expect("control poisoned") = Some(control.clone());
@@ -403,6 +411,27 @@ async fn session(
     *shared.control.lock().expect("control poisoned") = None;
     tracing::info!(%reason, "session over");
     Ok(end)
+}
+
+/// Turns a session error into a sentence for the user, plus the reject reason when the host
+/// turned us away.
+pub fn describe_error(err: &anyhow::Error) -> (String, Option<RejectReason>) {
+    if let Some(peet_core::ConnectError::Rejected(reason)) =
+        err.downcast_ref::<peet_core::ConnectError>()
+    {
+        let text = match reason {
+            RejectReason::PinRequired => "this host needs a PIN",
+            RejectReason::PinIncorrect => "wrong PIN",
+            RejectReason::NotAuthorised => "the host does not allow your Tailscale identity",
+            RejectReason::Busy => "the host is busy with another viewer",
+            RejectReason::NoCommonCodec => "no video codec in common with the host",
+            RejectReason::UnsupportedProtocolVersion => {
+                "the host runs an incompatible PeetConnect version"
+            }
+        };
+        return (text.to_string(), Some(*reason));
+    }
+    (format!("{err:#}"), None)
 }
 
 fn set_message(shared: &RemoteShared, message: String) {
