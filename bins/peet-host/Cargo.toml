@@ -31,5 +31,8 @@ peet-transport.workspace = true
 image.workspace = true
 windows.workspace = true
 
+[build-dependencies]
+peet-winres.workspace = true
+
 [lints]
 workspace = true

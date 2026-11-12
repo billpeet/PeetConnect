@@ -31,5 +31,8 @@ gpui = "0.2.2"
 raw-window-handle = "0.6"
 smallvec = "1"
 
+[build-dependencies]
+peet-winres.workspace = true
+
 [lints]
 workspace = true

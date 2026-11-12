@@ -1,4 +1,31 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#dc2626"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="32" font-weight="600" fill="#ffffff">P</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- PeetConnect app icon: a P whose bowl is a screen. Shapes sit on a 16 px grid
+       (16 units per px at 16x16) so the small sizes stay crisp; icon-small.svg is the
+       same geometry without the shadow and sheen. Regenerate the .ico with `cargo xtask icons`. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f05252"/>
+      <stop offset="1" stop-color="#c81e1e"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8f1d1d"/>
+      <stop offset="1" stop-color="#4c0a0a"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="screen">
+      <rect x="96" y="80" width="80" height="48" rx="6"/>
+    </clipPath>
+    <filter id="shadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#450a0a" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect x="2" y="2" width="252" height="252" rx="54" fill="none" stroke="url(#rim)" stroke-width="4"/>
+  <path filter="url(#shadow)" fill="#ffffff"
+        d="M64 76 A28 28 0 0 1 92 48 H180 A28 28 0 0 1 208 76 V132 A28 28 0 0 1 180 160 H96 V192 A16 16 0 0 1 64 192 Z"/>
+  <rect x="96" y="80" width="80" height="48" rx="6" fill="url(#glass)"/>
+  <path clip-path="url(#screen)" fill="#ffffff" fill-opacity="0.14" d="M96 80 H148 L120 128 H96 Z"/>
 </svg>

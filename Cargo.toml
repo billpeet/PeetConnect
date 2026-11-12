@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "bins/*"]
+members = ["crates/*", "bins/*", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,7 @@ peet-input = { path = "crates/peet-input" }
 peet-proto = { path = "crates/peet-proto" }
 peet-tailscale = { path = "crates/peet-tailscale" }
 peet-transport = { path = "crates/peet-transport" }
+peet-winres = { path = "crates/peet-winres" }
 
 anyhow = "1.0"
 base64 = "0.22"

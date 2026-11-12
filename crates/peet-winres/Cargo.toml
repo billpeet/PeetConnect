@@ -1,0 +1,15 @@
+[package]
+name = "peet-winres"
+description = "Build-script helper: embeds the PeetConnect icon and version info in Windows executables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+embed-resource = "3"
+
+[lints]
+workspace = true

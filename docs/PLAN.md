@@ -257,6 +257,8 @@ the top edge; the window title names the host. Verified on the dev box by drivin
 through the host: PIN rejection, PIN retry, pills, fullscreen reveal, host kill showing
 "Reconnecting" and recovering, disconnect to home.
 
+*App icon (2026-11-13)* — `assets/icon.svg`: a P whose bowl is a screen, on the red rounded square, drawn on a 16 px grid with a flat variant for small frames. `cargo xtask icons` renders a 10-frame `.ico` (16–256) with resvg; `peet-winres` embeds it as icon resource 1 (the ID GPUI's window class loads, so it reaches the taskbar and Alt+Tab) plus VERSIONINFO in the viewer, host and CLI. Verified: Explorer icon, window-class icon and file-properties description on all three exes.
+
 Not done: file transfer, host tray app, per-monitor bitrate budgeting in all-monitors mode (each
 stream keeps the full cap), remembering a PIN per host. Exit — replaces AnyDesk for personal use — is close for the viewer side; the service still
 needs an administrator to verify unattended use (neither test machine's user is one).

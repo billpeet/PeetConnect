@@ -22,5 +22,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[build-dependencies]
+peet-winres.workspace = true
+
 [lints]
 workspace = true
