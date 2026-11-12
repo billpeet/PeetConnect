@@ -4,11 +4,13 @@ mod device;
 mod dxgi;
 mod gdi;
 mod monitors;
+mod source;
 
 pub use device::D3dDevice;
 pub use dxgi::DxgiCapturer;
 pub use gdi::GdiCapturer;
 pub use monitors::enumerate_monitors;
+pub use source::{Backend, FrameSource, DXGI_GRACE};
 
 /// Re-export so downstream crates share one `windows` version for texture types.
 pub use ::windows;

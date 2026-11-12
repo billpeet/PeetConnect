@@ -8,7 +8,7 @@ Windows host + viewer first; Linux and Android later. MIT licensed, clean room.
 | Topic | Decision |
 |---|---|
 | Language | Rust end to end |
-| Viewer UI | GPUI (Zed's UI framework). Video surface risk mitigated by a dedicated D3D11 child HWND if GPUI's image path can't hold 60 fps at 4K (spike in M2) |
+| Viewer UI | GPUI (Zed's UI framework) for chrome. Video is presented by our own D3D11 swap chain on a DirectComposition visual attached beneath GPUI's window, showing through a transparent region (decided in M2; GPUI's image path and plain child HWNDs both ruled out) |
 | Transport | QUIC (quinn) over Tailscale only in v1. No relay, no NAT traversal. Relay is a later, optional component |
 | Auth | Tailscale identity via LocalAPI `whois` on the peer address, plus an allow-list (tailnet users / tags / node IDs) and optional per-host PIN. No account system of our own |
 | Unattended access | In v1. Host runs as a Windows service (SYSTEM) with a per-session helper for capture, input, clipboard and secure desktop |
@@ -113,11 +113,30 @@ needs a capture watchdog that falls back to GDI (the bench already does this), a
 evaluate Windows.Graphics.Capture as a third backend. DXGI timings are therefore still
 unmeasured here; expect ~1 ms per frame when it works.
 
-**M2 — Loopback viewer + GPUI spike.** (next) Decode and present in a GPUI window over an in-process
-channel. Measure present path at 4K60. Decide: GPUI image element vs D3D11 child HWND. Exit:
-60 fps local mirror with latency figure.
+**M2 — Loopback viewer + GPUI spike. Done 2026-11-12.** `peet-codec` gained a Media Foundation
+H.264 decoder with DXVA output (NV12 D3D11 textures) and a general `GpuConverter`
+(convert/scale between BGRA and NV12, blit into any render target). `peet-capture` gained
+`FrameSource` (DXGI with GDI watchdog fallback, shared by bench and viewer). `peet-viewer`
+is a GPUI app running capture→encode→decode→present in-process with two presenters.
 
-**M3 — Network.** QUIC over Tailscale, whois auth + allow-list, codec negotiation, cursor,
+Measured (RTX 4070 SUPER, GDI capture at ~25 ms is the bottleneck, release build):
+
+| Presenter | 1080p | 4K (upscaled) | Verdict |
+|---|---|---|---|
+| GPUI `img` element (NV12→BGRA→staging readback→`RenderImage`) | 7–9 ms/frame, pipeline drops to 22 fps, +25 ms UI latency | 23–40 ms/frame, pipeline drops to 10 fps | rejected |
+| Child HWND with own swap chain | never visible | never visible | rejected: GPUI's window is `WS_EX_NOREDIRECTIONBITMAP`, children have no surface |
+| **DirectComposition visual under GPUI** (NV12→BGRA by video processor→copy to back buffer) | 0.1 ms/frame, 30 fps (capture-bound) | 0.1 ms/frame, 30 fps | **chosen** |
+
+Decode costs 0.25 ms per frame at both sizes (DXVA). Capture-to-present is capture + encode +
+one vsync. GPUI renders its chrome at 60 fps over the video; input goes to GPUI as normal.
+
+Design that follows: the viewer opens its GPUI window with a transparent background, leaves
+the video element unpainted, publishes the HWND and the element's physical-pixel bounds, and
+the video thread owns a composition target (`topmost = false`; GPUI holds the topmost one),
+a visual and a flip-model swap chain sized to the bounds. Multi-monitor views are more
+visuals on the same target.
+
+**M3 — Network.** (next) QUIC over Tailscale, whois auth + allow-list, codec negotiation, cursor,
 adaptive bitrate, keyframe recovery. Host runs as a plain user process (`--console`). Exit:
 remote view between two tailnet machines.
 
@@ -142,6 +161,8 @@ Android viewer, signing + auto-update, distribution.
 - DPI and resolution changes mid-session (DXGI returns ACCESS_LOST; reinit, send new monitor layout).
 - Keyboard: send scancodes not VKs where possible; handle layout mismatch and stuck modifiers on focus loss.
 - GPUI on Windows: API churn and sparse docs. Pin a version; isolate UI from peet-core.
+- GPUI has no surface/texture element on Windows and its window has no redirection bitmap:
+  video must go through DirectComposition (see M2). Do not try child HWNDs again.
 - DXGI duplication can silently deliver nothing (seen on the dev box). Always keep a GDI
   fallback behind a watchdog, and consider Windows.Graphics.Capture.
 - Hardware MFTs are per-vendor; on multi-GPU machines try each until one accepts the device.

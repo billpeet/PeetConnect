@@ -33,7 +33,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 
-use super::convert::BgraToNv12;
+use super::convert::GpuConverter;
 use crate::nv12::bgra_to_nv12;
 use crate::{contains_idr, CodecError, EncodedPacket, EncoderConfig, VideoEncoder};
 
@@ -60,7 +60,7 @@ pub fn list_encoders() -> Result<Vec<EncoderInfo>, CodecError> {
 }
 
 struct D3dPath {
-    converter: BgraToNv12,
+    converter: GpuConverter,
     _manager: IMFDXGIDeviceManager,
 }
 
@@ -164,7 +164,12 @@ impl MfH264Encoder {
                     transform
                         .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
                     Some(D3dPath {
-                        converter: BgraToNv12::new(device, context, config.width, config.height)?,
+                        converter: GpuConverter::bgra_to_nv12(
+                            device,
+                            context,
+                            config.width,
+                            config.height,
+                        )?,
                         _manager: manager,
                     })
                 }
@@ -276,7 +281,7 @@ impl MfH264Encoder {
             .d3d
             .as_mut()
             .ok_or_else(|| CodecError::InvalidInput("encoder has no D3D device".into()))?;
-        let nv12 = path.converter.convert(texture)?;
+        let nv12 = path.converter.convert(texture, 0)?;
         // SAFETY: nv12 is a live texture on the device the encoder is bound to.
         let sample = unsafe {
             let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nv12, 0, false)?;
@@ -479,7 +484,7 @@ impl Drop for MfH264Encoder {
     }
 }
 
-fn init_mf() -> Result<(), CodecError> {
+pub(crate) fn init_mf() -> Result<(), CodecError> {
     static INIT: OnceLock<Result<(), (i32, String)>> = OnceLock::new();
     INIT.get_or_init(|| {
         // SAFETY: process-wide initialisation; a changed-mode error means COM is already up.

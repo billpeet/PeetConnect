@@ -13,9 +13,10 @@ Status: early development. See [docs/PLAN.md](docs/PLAN.md) for architecture and
 | `crates/peet-proto` | Wire protocol types and framing. No platform code. |
 | `crates/peet-tailscale` | Client for the local tailscaled API: peer discovery and `whois` identity. |
 | `crates/peet-capture` | Screen capture: DXGI Desktop Duplication with GDI fallback (Windows). |
-| `crates/peet-codec` | H.264 encoders: Media Foundation hardware/software, openh264 fallback. |
+| `crates/peet-codec` | H.264 encode (Media Foundation hardware/software, openh264 fallback) and decode (Media Foundation + DXVA), GPU colour conversion. |
 | `bins/peet` | Command line. |
 | `bins/peet-bench` | Capture and encode benchmarks. |
+| `bins/peet-viewer` | GPUI viewer. Currently a loopback test rig: capture, encode, decode and present locally. |
 
 ## Try it
 
@@ -34,6 +35,14 @@ cargo run --release -p peet-bench -- capture --seconds 5   # writes bench-out/mo
 ```
 
 The benchmark opens animated windows on each monitor so the capturer always has motion.
+
+```
+cargo run --release -p peet-viewer -- --present d3d            # loopback mirror of the primary monitor
+cargo run --release -p peet-viewer -- --present d3d --upscale 3840x2160 --bitrate-kbps 30000
+cargo run --release -p peet-viewer -- --present gpui           # the rejected image-element path, for comparison
+```
+
+Stage timings print to stderr every two seconds.
 
 ## Development
 

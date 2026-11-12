@@ -1,0 +1,27 @@
+[package]
+name = "peet-viewer"
+description = "PeetConnect desktop viewer (GPUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gpui = "0.2.2"
+image = "0.25"
+peet-capture.workspace = true
+peet-codec.workspace = true
+peet-proto.workspace = true
+raw-window-handle = "0.6"
+smallvec = "1"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[lints]
+workspace = true

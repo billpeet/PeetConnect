@@ -4,6 +4,8 @@
 //!
 //! * [`windows::MfH264Encoder`]: Media Foundation H.264, hardware (NVENC, AMF, Quick Sync via
 //!   their MFTs) or Microsoft's software MFT. Accepts GPU textures for a zero-copy path.
+//! * [`windows::MfH264Decoder`]: Media Foundation H.264 decoder with DXVA, producing NV12
+//!   D3D11 textures.
 //! * [`OpenH264Encoder`]: Cisco's openh264, pure CPU, works everywhere. The fallback.
 //!
 //! Output is Annex B H.264 (start-code delimited NAL units), one access unit per packet.

@@ -109,26 +109,20 @@ mod win {
     use std::io::{BufWriter, Write};
     use std::time::{Duration, Instant};
 
-    use anyhow::{Context, Result};
-    use peet_capture::windows::{enumerate_monitors, D3dDevice, DxgiCapturer, GdiCapturer};
-    use peet_capture::{CaptureError, CpuFrame, FrameMeta, MonitorDesc};
+    use anyhow::Result;
+    use peet_capture::windows::{
+        enumerate_monitors, Backend, D3dDevice, DxgiCapturer, FrameSource,
+    };
+    use peet_capture::{CaptureError, CpuFrame, MonitorDesc};
     use peet_codec::windows::{list_encoders, MfH264Encoder};
     use peet_codec::{EncoderConfig, EncoderKind, VideoEncoder};
     use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::Graphics::Direct3D11::{
-        ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-        D3D11_CPU_ACCESS_FLAG, D3D11_USAGE_DEFAULT,
-    };
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
 
     use super::{CaptureBackend, Command, Encoder, Path};
-
-    /// How long `auto` waits for DXGI to produce a desktop frame before switching to GDI.
-    const DXGI_GRACE: Duration = Duration::from_millis(1500);
 
     pub fn run(command: Command) -> Result<()> {
         // SAFETY: process-wide setting; must happen before any window or DXGI call.
@@ -265,106 +259,6 @@ mod win {
         bitrate_kbps: u32,
     }
 
-    /// A frame source that always ends with the latest frame in a GPU texture.
-    enum Source {
-        Dxgi(DxgiCapturer),
-        Gdi {
-            cap: GdiCapturer,
-            device: D3dDevice,
-            texture: ID3D11Texture2D,
-            interval: Duration,
-            next: Instant,
-        },
-    }
-
-    impl Source {
-        fn dxgi(device: &D3dDevice, monitor: &MonitorDesc) -> Result<Self> {
-            Ok(Source::Dxgi(
-                DxgiCapturer::new(device.clone(), monitor)
-                    .with_context(|| format!("duplicating {}", monitor.name))?,
-            ))
-        }
-
-        fn gdi(device: &D3dDevice, monitor: &MonitorDesc, fps: u32) -> Result<Self> {
-            let cap = GdiCapturer::new(monitor)?;
-            let (w, h) = cap.size();
-            let texture = device.create_texture(
-                w,
-                h,
-                DXGI_FORMAT_B8G8R8A8_UNORM,
-                D3D11_USAGE_DEFAULT,
-                D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
-                D3D11_CPU_ACCESS_FLAG(0),
-            )?;
-            Ok(Source::Gdi {
-                cap,
-                device: device.clone(),
-                texture,
-                interval: Duration::from_secs(1) / fps.max(1),
-                next: Instant::now(),
-            })
-        }
-
-        fn name(&self) -> &'static str {
-            match self {
-                Source::Dxgi(_) => "dxgi",
-                Source::Gdi { .. } => "gdi",
-            }
-        }
-
-        fn size(&self) -> (u32, u32) {
-            match self {
-                Source::Dxgi(c) => c.size(),
-                Source::Gdi { cap, .. } => cap.size(),
-            }
-        }
-
-        /// Blocks until the next frame slot for paced sources. Not counted as capture time.
-        fn wait_for_slot(&mut self) {
-            if let Source::Gdi { interval, next, .. } = self {
-                let now = Instant::now();
-                if *next > now {
-                    std::thread::sleep(*next - now);
-                }
-                let floor = Instant::now().checked_sub(*interval).unwrap_or(now);
-                *next = (*next + *interval).max(floor);
-            }
-        }
-
-        fn acquire(&mut self, timeout: Duration) -> Result<FrameMeta, CaptureError> {
-            match self {
-                Source::Dxgi(c) => c.acquire(timeout),
-                Source::Gdi {
-                    cap,
-                    device,
-                    texture,
-                    ..
-                } => {
-                    let meta = cap.capture()?;
-                    cap.upload(device, texture);
-                    Ok(meta)
-                }
-            }
-        }
-
-        fn texture(&self) -> &ID3D11Texture2D {
-            match self {
-                Source::Dxgi(c) => c.texture(),
-                Source::Gdi { texture, .. } => texture,
-            }
-        }
-
-        fn read_cpu(&mut self, out: &mut CpuFrame) -> Result<(), CaptureError> {
-            match self {
-                Source::Dxgi(c) => c.read_cpu(out),
-                Source::Gdi { cap, .. } => {
-                    cap.read_cpu(out);
-                    Ok(())
-                }
-            }
-        }
-    }
-
     enum Enc {
         None,
         Texture(MfH264Encoder),
@@ -422,10 +316,12 @@ mod win {
 
     fn run_monitor(monitor: &MonitorDesc, opts: &Opts) -> Result<Report> {
         let device = D3dDevice::for_adapter(monitor.adapter_index)?;
-        let mut source = match opts.capture {
-            CaptureBackend::Gdi => Source::gdi(&device, monitor, opts.fps)?,
-            CaptureBackend::Dxgi | CaptureBackend::Auto => Source::dxgi(&device, monitor)?,
+        let backend = match opts.capture {
+            CaptureBackend::Auto => Backend::Auto,
+            CaptureBackend::Dxgi => Backend::Dxgi,
+            CaptureBackend::Gdi => Backend::Gdi,
         };
+        let mut source = FrameSource::new(device.clone(), monitor, backend, opts.fps)?;
         let (width, height) = source.size();
         let mut encoder = make_encoder(opts, &device, width, height)?;
         let mut writer = match &opts.out {
@@ -441,18 +337,6 @@ mod win {
         let start = Instant::now();
         let mut first_frame_at: Option<Instant> = None;
         while start.elapsed() < opts.duration {
-            if opts.capture == CaptureBackend::Auto
-                && first_frame_at.is_none()
-                && matches!(source, Source::Dxgi(_))
-                && start.elapsed() > DXGI_GRACE
-            {
-                tracing::warn!(
-                    monitor = %monitor.name,
-                    "DXGI delivered no frames in {DXGI_GRACE:?}; switching to GDI capture"
-                );
-                source = Source::gdi(&device, monitor, opts.fps)?;
-                stats.fell_back = true;
-            }
             source.wait_for_slot();
             let t0 = Instant::now();
             let meta = match source.acquire(Duration::from_millis(100)) {
@@ -463,7 +347,6 @@ mod win {
                 }
                 Err(CaptureError::AccessLost) => {
                     stats.access_lost += 1;
-                    source = Source::dxgi(&device, monitor)?;
                     continue;
                 }
                 Err(err) => return Err(err.into()),
@@ -516,6 +399,7 @@ mod win {
             w.flush()?;
         }
         let active = first_frame_at.map_or(Duration::ZERO, |t| t.elapsed());
+        stats.fell_back = source.fell_back();
         Ok(Report {
             monitor: format!("{} ({}x{})", monitor.name, width, height),
             source: source.name(),
