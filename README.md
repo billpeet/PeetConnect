@@ -158,7 +158,9 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
-CI runs the same on Windows and Ubuntu with warnings denied.
+CI runs the same on Windows and Ubuntu with warnings denied. `Cargo.lock` pins `libc` to 0.2.189:
+GPUI's Linux build pulls `xattr 0.2`, which does not compile against newer `libc`; keep the pin
+when running `cargo update` until GPUI drops that dependency.
 
 ## Licence
 
