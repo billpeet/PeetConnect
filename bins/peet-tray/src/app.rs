@@ -44,6 +44,7 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_UPDATE: u32 = WM_APP + 2;
 const TRAY_ID: u32 = 1;
 const TIMER_AUTOSTART: usize = 1;
+const TIMER_RETRY_UPDATE: usize = 2;
 /// How long to wait for an existing host (a service worker may be starting) before starting
 /// a console host.
 const AUTOSTART_GRACE_MS: u32 = 1500;
@@ -116,11 +117,50 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
+/// Runs `f` on the app state. Returns `None` when there is no app yet or it is already
+/// borrowed further up this thread's stack, which happens when a call made while holding it
+/// (a shell call, a cross-process send) pumps messages back into `window_proc`. Callers
+/// either retry later or treat the message as handled; never panic here, since a panic in a
+/// window procedure aborts the process.
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
-    APP.with(|app| app.borrow_mut().as_mut().map(f))
+    APP.with(|app| app.try_borrow_mut().ok()?.as_mut().map(f))
+}
+
+/// Work done after the app borrow is released because it may pump messages.
+enum Deferred {
+    Open(PathBuf),
+}
+
+impl Deferred {
+    fn run(self) {
+        match self {
+            Deferred::Open(path) => host::open(&path),
+        }
+    }
+}
+
+/// Appends panics to `%LOCALAPPDATA%\PeetConnect\tray.log`: the tray has no console, and a
+/// crash report alone says nothing about where it happened.
+fn install_panic_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = host::log_path().map(|p| p.with_file_name("tray.log")) {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let backtrace = std::backtrace::Backtrace::force_capture();
+                let _ = writeln!(file, "{} panic: {info}\n{backtrace}", now_unix_ms());
+            }
+        }
+        default(info);
+    }));
 }
 
 pub fn run(start_host: bool) -> Result<()> {
+    install_panic_log();
     // SAFETY: plain Win32 calls with constant arguments.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -216,6 +256,12 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A panic cannot unwind out of a window procedure (the process would abort), so contain
+    // it: the panic hook has logged it, and the tray carries on.
+    std::panic::catch_unwind(|| handle_message(hwnd, msg, wparam, lparam)).unwrap_or(LRESULT(0))
+}
+
+fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_APP_TRAY => {
             // NOTIFYICON_VERSION_4: the event is in the low word of lParam.
@@ -227,10 +273,23 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_APP_UPDATE => {
-            with_app(|app| {
+            let handled = with_app(|app| {
                 app.refresh();
                 app.show_notices();
             });
+            if handled.is_none() {
+                // Busy further up the stack; try again shortly.
+                // SAFETY: timer on our own window.
+                unsafe { SetTimer(Some(hwnd), TIMER_RETRY_UPDATE, 100, None) };
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_RETRY_UPDATE => {
+            // SAFETY: our own timer and window.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_RETRY_UPDATE);
+                let _ = PostMessageW(Some(hwnd), WM_APP_UPDATE, WPARAM(0), LPARAM(0));
+            }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TIMER_AUTOSTART => {
@@ -288,7 +347,9 @@ fn show_menu() {
         choice.0 as usize
     };
     if choice != 0 {
-        with_app(|app| app.command(choice));
+        if let Some(deferred) = with_app(|app| app.command(choice)).flatten() {
+            deferred.run();
+        }
     }
 }
 
@@ -478,7 +539,9 @@ impl App {
         Ok((menu, self.hwnd))
     }
 
-    fn command(&mut self, id: usize) {
+    /// Acts on a menu choice. Anything that may pump messages (opening files through the
+    /// shell) is returned for the caller to run once the app borrow is released.
+    fn command(&mut self, id: usize) -> Option<Deferred> {
         let status = self.status();
         match id {
             CMD_PAUSE => {
@@ -498,18 +561,14 @@ impl App {
                     .or_else(host::default_config_path);
                 if let Some(path) = path {
                     match host::ensure_config(&path) {
-                        Ok(()) => host::open(&path),
+                        Ok(()) => return Some(Deferred::Open(path)),
                         Err(err) => {
                             self.balloon("Could not open the configuration", &format!("{err:#}"));
                         }
                     }
                 }
             }
-            CMD_LOG => {
-                if let Some(path) = host::log_path() {
-                    host::open(&path);
-                }
-            }
+            CMD_LOG => return host::log_path().map(Deferred::Open),
             CMD_AUTOSTART => {
                 if let Err(err) = host::set_autostart(!host::autostart_enabled()) {
                     self.balloon("Could not change Start with Windows", &format!("{err:#}"));
@@ -526,6 +585,7 @@ impl App {
             }
             _ => {}
         }
+        None
     }
 
     fn request(&self, request: Request) {
