@@ -406,9 +406,16 @@ the same latent bug) waits for the next change; the stream thread must re-encode
 on a keyframe request, and a slow refresh would help too. All `.h264` outputs decode with ffprobe
 at the expected frame counts.
 
-Not yet decided: making `Auto` DXGI → WGC → GDI. The numbers favour it (on the dev box `Auto`
-lands on GDI today), but fix the keyframe-on-still-frame issue first, and WGC from the SYSTEM
-service worker is still untested.
+*Follow-up (2026-11-13)* — Keyframes on a still screen: the stream thread now re-encodes the last
+captured texture when a keyframe is requested and no new frame has arrived (and forgets the
+texture on `AccessLost`, when the source is rebuilt). Verified against a loopback test host with
+`capture = "wgc"` on two still monitors (1 frame in 3 s each): five keyframe requests per monitor
+answered in 50–110 ms. `Auto` is now DXGI → WGC → GDI, each step after 1.5 s without a frame;
+the service worker (`follow_desktop`) uses `Backend::AutoNoWgc`, the old DXGI → GDI chain, until
+WGC is tested from SYSTEM and across a secure-desktop switch. Verified by forcing DXGI silent
+(temporary patch, reverted): the bench switched to WGC after 1.5 s and ran at 44 fps. Note: DXGI
+Desktop Duplication now delivers frames on the dev box (the M1 open issue no longer reproduces,
+39 fps on DISPLAY2), so `Auto` stays on DXGI there.
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.

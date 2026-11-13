@@ -1,8 +1,9 @@
 //! A frame source that picks a backend and keeps the latest frame in a GPU texture.
 //!
-//! Wraps [`DxgiCapturer`], [`WgcCapturer`] and [`GdiCapturer`] behind one interface, with a watchdog: in
-//! `Auto` mode, if Desktop Duplication produces no desktop frame within a grace period the
-//! source switches to GDI. Desktop Duplication can fail silently in exactly this way.
+//! Wraps [`DxgiCapturer`], [`WgcCapturer`] and [`GdiCapturer`] behind one interface, with a
+//! watchdog: in `Auto` mode, if Desktop Duplication produces no desktop frame within a grace
+//! period the source switches to Windows.Graphics.Capture, and if that delivers nothing either
+//! (or cannot start), to GDI. Desktop Duplication can fail silently in exactly this way.
 
 use std::time::{Duration, Instant};
 
@@ -17,16 +18,19 @@ use crate::{CaptureError, CpuFrame, FrameMeta, MonitorDesc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// DXGI first; fall back to GDI if it delivers nothing.
+    /// DXGI first; fall back to WGC, then GDI, if a backend delivers nothing.
     #[default]
     Auto,
+    /// DXGI first; fall back straight to GDI. For threads that follow the input desktop
+    /// (service worker): WGC is untested from the SYSTEM account and on the secure desktop.
+    AutoNoWgc,
     Dxgi,
     /// Windows.Graphics.Capture of the whole monitor.
     Wgc,
     Gdi,
 }
 
-/// How long `Auto` waits for DXGI to produce a desktop frame before switching to GDI.
+/// How long `Auto` waits for a backend to produce a desktop frame before trying the next.
 pub const DXGI_GRACE: Duration = Duration::from_millis(1500);
 
 enum Inner {
@@ -70,15 +74,8 @@ impl FrameSource {
     ) -> Result<Self, CaptureError> {
         let inner = match backend {
             Backend::Gdi => gdi(&device, monitor, fps)?,
-            Backend::Wgc => Inner::Wgc(WgcCapturer::new(
-                device.clone(),
-                WgcTarget::Monitor(monitor.clone()),
-                WgcOptions {
-                    min_interval: Some(Duration::from_secs(1) / fps.max(1)),
-                    ..WgcOptions::default()
-                },
-            )?),
-            Backend::Dxgi | Backend::Auto => {
+            Backend::Wgc => wgc(&device, monitor, fps)?,
+            Backend::Dxgi | Backend::Auto | Backend::AutoNoWgc => {
                 Inner::Dxgi(DxgiCapturer::new(device.clone(), monitor)?)
             }
         };
@@ -137,17 +134,11 @@ impl FrameSource {
     /// [`CaptureError::AccessLost`] the DXGI session is recreated transparently and the
     /// error is still returned so the caller can account for it.
     pub fn acquire(&mut self, timeout: Duration) -> Result<FrameMeta, CaptureError> {
-        if self.backend == Backend::Auto
+        if matches!(self.backend, Backend::Auto | Backend::AutoNoWgc)
             && !self.got_frame
-            && matches!(self.inner, Inner::Dxgi(_))
             && self.started.elapsed() > DXGI_GRACE
         {
-            tracing::warn!(
-                monitor = %self.monitor.name,
-                "DXGI delivered no frames in {DXGI_GRACE:?}; switching to GDI capture"
-            );
-            self.inner = gdi(&self.device, &self.monitor, self.fps)?;
-            self.fell_back = true;
+            self.fall_back()?;
         }
         let result = match &mut self.inner {
             Inner::Dxgi(c) => c.acquire(timeout),
@@ -166,6 +157,36 @@ impl FrameSource {
             _ => {}
         }
         result
+    }
+
+    /// Moves to the next backend in the `Auto` chain after the current one stayed silent.
+    fn fall_back(&mut self) -> Result<(), CaptureError> {
+        let try_wgc = self.backend == Backend::Auto && matches!(self.inner, Inner::Dxgi(_));
+        if try_wgc {
+            match wgc(&self.device, &self.monitor, self.fps) {
+                Ok(inner) => {
+                    tracing::warn!(
+                        monitor = %self.monitor.name,
+                        "DXGI delivered no frames in {DXGI_GRACE:?}; switching to WGC capture"
+                    );
+                    self.inner = inner;
+                    self.fell_back = true;
+                    self.started = Instant::now();
+                    return Ok(());
+                }
+                Err(err) => tracing::warn!(monitor = %self.monitor.name, %err, "WGC unavailable"),
+            }
+        }
+        if !matches!(self.inner, Inner::Gdi { .. }) {
+            tracing::warn!(
+                monitor = %self.monitor.name, from = self.name(),
+                "no frames in {DXGI_GRACE:?}; switching to GDI capture"
+            );
+            self.inner = gdi(&self.device, &self.monitor, self.fps)?;
+            self.fell_back = true;
+            self.started = Instant::now();
+        }
+        Ok(())
     }
 
     /// Latest frame, BGRA8 on the GPU (DXGI may report another format via
@@ -188,6 +209,17 @@ impl FrameSource {
             }
         }
     }
+}
+
+fn wgc(device: &D3dDevice, monitor: &MonitorDesc, fps: u32) -> Result<Inner, CaptureError> {
+    Ok(Inner::Wgc(WgcCapturer::new(
+        device.clone(),
+        WgcTarget::Monitor(monitor.clone()),
+        WgcOptions {
+            min_interval: Some(Duration::from_secs(1) / fps.max(1)),
+            ..WgcOptions::default()
+        },
+    )?))
 }
 
 fn gdi(device: &D3dDevice, monitor: &MonitorDesc, fps: u32) -> Result<Inner, CaptureError> {

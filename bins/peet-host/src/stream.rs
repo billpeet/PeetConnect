@@ -146,12 +146,11 @@ impl Worker {
             .then(crate::desktop::attach_input_desktop)
             .flatten();
         let device = D3dDevice::for_adapter(self.monitor.adapter_index)?;
-        let mut source = FrameSource::new(
-            device.clone(),
-            &self.monitor,
-            self.params.backend,
-            self.params.fps,
-        )?;
+        let backend = match self.params.backend {
+            Backend::Auto if self.params.follow_desktop => Backend::AutoNoWgc,
+            other => other,
+        };
+        let mut source = FrameSource::new(device.clone(), &self.monitor, backend, self.params.fps)?;
         let (width, height) = source.size();
         let enc_config = EncoderConfig {
             width,
@@ -187,17 +186,30 @@ impl Worker {
         // that joins an existing stream later asks explicitly.
         encoder.request_keyframe();
 
+        // True once the source texture holds a real frame. DXGI and WGC only deliver frames
+        // when something changes, so on a still screen a keyframe request re-encodes this
+        // texture instead of waiting for the next change.
+        let mut have_frame = false;
         while !self.stop.load(Ordering::Relaxed) {
             source.wait_for_slot();
-            let meta = match source.acquire(Duration::from_millis(100)) {
-                Ok(meta) => meta,
-                Err(CaptureError::Timeout | CaptureError::AccessLost) => continue,
+            let fresh = match source.acquire(Duration::from_millis(100)) {
+                Ok(meta) => {
+                    if let Some(update) = cursor.update(meta.cursor.as_ref(), &self.monitor) {
+                        let _ = self.control.try_send(ControlMessage::Cursor(update));
+                    }
+                    meta.desktop_updated
+                }
+                Err(CaptureError::Timeout) => false,
+                Err(CaptureError::AccessLost) => {
+                    // The source was recreated with a new, empty texture.
+                    have_frame = false;
+                    continue;
+                }
                 Err(err) => return Err(err.into()),
             };
-            if let Some(update) = cursor.update(meta.cursor.as_ref(), &self.monitor) {
-                let _ = self.control.try_send(ControlMessage::Cursor(update));
-            }
-            if !meta.desktop_updated {
+            have_frame |= fresh;
+            let repeat = !fresh && have_frame && self.keyframe.load(Ordering::Relaxed);
+            if !fresh && !repeat {
                 continue;
             }
             if self.frame_tx.capacity() == 0 {
