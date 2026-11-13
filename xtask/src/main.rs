@@ -7,8 +7,11 @@
 //!   artwork.
 //! - `dist`: build the release binaries, then stage, zip and build the installer
 //!   (see `dist.rs`).
+//! - `release`, `check-tag`, `notes`, `manifest`, `keygen`: versioning and the signed update
+//!   manifest (see `release.rs`).
 
 mod dist;
+mod release;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,7 +38,15 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("icons") => icons(),
         Some("dist") => dist::dist(&args[1..]),
-        _ => bail!("usage: cargo xtask icons | dist [--no-build] [--no-installer]"),
+        Some("release") => release::release(&args[1..]),
+        Some("check-tag") => release::check_tag(&args[1..]),
+        Some("notes") => release::notes(&args[1..]),
+        Some("manifest") => release::manifest(&args[1..]),
+        Some("keygen") => release::keygen(&args[1..]),
+        _ => bail!(
+            "usage: cargo xtask <icons | dist [--no-build] [--no-installer] | release <version> \
+             | check-tag <tag> | notes [<version>] | manifest | keygen <private-key-file>>"
+        ),
     }
 }
 

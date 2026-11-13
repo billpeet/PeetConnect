@@ -1,0 +1,97 @@
+name: Release
+
+# Pushing a tag v<version> (made by `cargo xtask release <version>`) builds the installer and
+# portable zip, smoke-tests the installer, signs the update manifest and creates a DRAFT
+# GitHub release. Publishing the draft is the manual gate: only then does
+# releases/latest/download/latest.json, which installed copies poll, point at it.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release
+  id-token: write # build provenance attestation
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Check the tag matches the workspace version
+        run: cargo xtask check-tag "${{ github.ref_name }}"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build installer and zip
+        run: cargo xtask dist
+
+      - name: Smoke-test the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem target/dist/*-setup.exe).FullName
+          # Wait on the setup process only (Start-Process -Wait also waits for children).
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=addtopath','/LOG=install.log' -PassThru
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 40; throw "setup exited with $($p.ExitCode)" }
+          $app = "$env:LOCALAPPDATA\Programs\PeetConnect"
+          foreach ($exe in 'peet','peet-host','peet-viewer') {
+            $out = & "$app\$exe.exe" --version | Out-String
+            Write-Host "$exe -> $($out.Trim())"
+            if ($out -notmatch [regex]::Escape("${{ github.ref_name }}".TrimStart('v'))) { throw "$exe reports the wrong version" }
+          }
+          if (-not (Test-Path "$app\peet-tray.exe")) { throw 'peet-tray.exe missing' }
+          $u = Start-Process "$app\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+          $u.WaitForExit()
+          # The uninstaller finishes from a temporary copy; give it a moment.
+          for ($i = 0; $i -lt 60 -and (Test-Path $app); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path $app) { Get-ChildItem $app; throw 'uninstall left the install folder behind' }
+          Write-Host 'install, version check and uninstall OK'
+
+      - name: Sign the update manifest
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: cargo xtask manifest
+
+      - name: Release notes
+        shell: pwsh
+        run: cargo xtask notes | Out-File -Encoding utf8 notes.md
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            target/dist/PeetConnect-*-setup.exe
+            target/dist/PeetConnect-*-x64.zip
+
+      - name: Create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          $flags = @('--draft', '--title', "PeetConnect $version", '--notes-file', 'notes.md')
+          # A pre-release (0.3.0-beta.1) is never served as releases/latest, so updaters skip it.
+          if ($version.Contains('-')) { $flags += '--prerelease' }
+          gh release create $tag @flags `
+            "target/dist/PeetConnect-$version-setup.exe" `
+            "target/dist/PeetConnect-$version-x64.zip" `
+            target/dist/latest.json `
+            target/dist/latest.json.sig `
+            target/dist/SHA256SUMS

@@ -7714,8 +7714,11 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "ico",
  "resvg 0.50.0",
+ "ring",
+ "serde_json",
 ]
 
 [[package]]
