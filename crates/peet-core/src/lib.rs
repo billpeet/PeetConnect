@@ -358,6 +358,22 @@ impl Control {
         self.send(ControlMessage::FocusWindow { window }).await
     }
 
+    /// Asks the host to resize a window's visible bounds to `width` x `height`, keeping its
+    /// top-left corner. Fire-and-forget; the new bounds arrive as `Event::WindowChanged`.
+    pub async fn resize_window(
+        &self,
+        window: WindowId,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ConnectError> {
+        self.send(ControlMessage::ResizeWindow {
+            window,
+            width,
+            height,
+        })
+        .await
+    }
+
     /// Queues an input event. Input has its own stream so it is never stuck behind control
     /// traffic. Returns false if the queue is full.
     pub fn send_input(&self, event: InputEvent) -> bool {
@@ -556,6 +572,7 @@ async fn control_reader(
                 ControlMessage::SetStream { .. }
                 | ControlMessage::ListWindows { .. }
                 | ControlMessage::FocusWindow { .. }
+                | ControlMessage::ResizeWindow { .. }
                 | ControlMessage::RequestKeyframe { .. }
                 | ControlMessage::Screenshot(_)
                 | ControlMessage::SetClipboard { .. }

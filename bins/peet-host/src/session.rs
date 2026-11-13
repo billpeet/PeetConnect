@@ -282,6 +282,13 @@ async fn control_loop(
                             }
                         });
                     }
+                    ControlMessage::ResizeWindow { window, width, height } => {
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(err) = crate::window::resize(window.0, width, height) {
+                                tracing::info!(window = window.0, %err, "resize failed");
+                            }
+                        });
+                    }
                     ControlMessage::Screenshot(request) => {
                         let monitor = match request.source {
                             SourceId::Monitor(id) => monitors.iter().find(|m| m.id == id).cloned(),

@@ -176,6 +176,19 @@ impl RemoteShared {
         }
     }
 
+    /// Asks the host to resize the shown window's visible area to `width` x `height`.
+    pub fn resize_window(&self, width: u32, height: u32) {
+        let control = self.control.lock().expect("control poisoned").clone();
+        let window = self.status.lock().expect("status poisoned").window.clone();
+        if let (Some(control), Some(window)) = (control, window) {
+            control.try_send(ControlMessage::ResizeWindow {
+                window: window.id,
+                width,
+                height,
+            });
+        }
+    }
+
     /// Asks the network thread for a fresh window list.
     pub fn refresh_windows(&self) {
         let mut status = self.status.lock().expect("status poisoned");

@@ -373,7 +373,7 @@ the `--console` host is the tested path.
    invisible resize borders).
 4. CLI and MCP: `peet windows`, `peet screenshot --window <title>`.
 5. Viewer: window picker beside the monitor picker; a window is one tile in `present.rs`.
-6. Later polish: size the viewer to the remote window at 1:1, mirror its title, resize the
+6. Polish: size the viewer to the remote window at 1:1, mirror its title, resize the
    remote window when the viewer is resized.
 
 *Work item 1 (2026-11-13)* — `peet-capture`: `WgcCapturer` (free-threaded frame pool,
@@ -463,6 +463,29 @@ cleared on restore, and the closed card appeared. Not yet exercised by hand: cli
 the picker, and input into a window stream. Seen: the host sent only 1–5 fps of the animated
 test window while the viewer covered it, against ~26 fps in the earlier probe. Check whether DWM
 throttles covered windows, or whether it was the debug build.
+
+*Work item 6 (2026-11-13)*:
+- **Protocol:** `ResizeWindow { window, width, height }` sets a window's visible size and keeps
+  its top-left corner. The host adds the invisible borders, restores a maximised window first,
+  refuses a minimised one and enforces at least 64 px a side. The client gets
+  `peet-core resize_window` and the CLI `peet resize <host> <window> WxH`.
+- **Viewer:** a "match size" toggle, on by default and saved in `viewer.toml` as
+  `match_window_size`.
+  - When the host window's size changes, including when it is first picked, the viewer resizes
+    itself to show it 1:1 within the local display.
+  - When the user resizes the viewer, the host window follows once the size has held for 400 ms.
+  - Video-area changes within 700 ms of the viewer's own resize are not sent, and sizes within
+    2 px count as equal (DPI rounding). So the two never chase each other, and a host window too
+    big for the local display is shown scaled down rather than shrunk.
+  - Matching is off while fullscreen or maximised.
+- **Title:** the viewer title mirrors the remote window (done in item 5).
+
+Verified on a 150% display with `peet-bench testwindow --hold`:
+- `peet resize` gave exactly 1000x700.
+- Picking the window sized the viewer's video area to 999x699, and nothing was sent back.
+- Resizing the host window to 1632x1131 made the viewer follow.
+- Shrinking the viewer to a 1182x906 area resized the host window to 1183x906, which then held
+  still.
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.

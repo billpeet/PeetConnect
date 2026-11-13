@@ -77,7 +77,11 @@ enum Command {
     /// primary monitor that moves (2 s), resizes (4 s), minimises (6 s), restores (8 s) and
     /// closes itself (10 s), for testing window streams end to end.
     #[command(hide = true)]
-    Testwindow,
+    Testwindow {
+        /// Just keep the window open this many seconds, without the scripted changes.
+        #[arg(long)]
+        hold: Option<u64>,
+    },
     /// Internal: show a grey topmost window over a rectangle until killed (used by `window
     /// --occlude`).
     #[command(hide = true)]
@@ -268,7 +272,7 @@ mod win {
                 }
                 Ok(())
             }
-            Command::Testwindow => run_test_window(),
+            Command::Testwindow { hold } => run_test_window(hold),
             Command::Occluder { x, y, w, h } => {
                 let _cover = super::stimulate::occluder(x, y, w, h);
                 // The parent kills us when the phase ends.
@@ -536,7 +540,7 @@ mod win {
         })
     }
 
-    fn run_test_window() -> Result<()> {
+    fn run_test_window(hold: Option<u64>) -> Result<()> {
         use windows::Win32::UI::WindowsAndMessaging::{
             PostMessageW, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE,
         };
@@ -549,6 +553,13 @@ mod win {
         anyhow::ensure!(id != 0, "could not create the test window");
         let hwnd = HWND(usize::try_from(id).unwrap_or(0) as *mut core::ffi::c_void);
         println!("{id:#x}");
+        if let Some(secs) = hold {
+            std::thread::sleep(Duration::from_secs(secs));
+            // SAFETY: closing our own window.
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            let _ = thread.join();
+            return Ok(());
+        }
         let step = |at: u64, what: &str| {
             std::thread::sleep(Duration::from_secs(at));
             eprintln!("test window: {what}");

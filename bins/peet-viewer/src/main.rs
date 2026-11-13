@@ -203,6 +203,12 @@ mod app {
     const FPS_PRESETS: [u32; 2] = [30, 60];
     /// The in-session bar stays visible this close to the top edge while fullscreen.
     const REVEAL_BAR_PX: f32 = 40.0;
+    /// Height of the in-session bar, logical pixels.
+    const BAR_PX: f32 = 26.0;
+    /// A viewer resize by the user is sent to the host once it has held this long.
+    const RESIZE_SETTLE: Duration = Duration::from_millis(400);
+    /// Video-area changes this soon after the viewer resized itself are its own doing.
+    const SELF_RESIZE_GRACE: Duration = Duration::from_millis(700);
 
     /// Settings a session is started with.
     #[derive(Debug, Clone)]
@@ -355,6 +361,8 @@ mod app {
         pointer_y: f32,
         /// The host window list is open under the bar.
         picker_open: bool,
+        /// Window-size matching (see [`ViewerConfig::match_window_size`]).
+        size_sync: SizeSync,
         /// Last session's failure, shown on the home screen.
         last_error: Option<String>,
         /// A connect requested before the window handle was known: (target, display name).
@@ -406,6 +414,7 @@ mod app {
                 title: String::new(),
                 pointer_y: 0.0,
                 picker_open: false,
+                size_sync: SizeSync::default(),
                 last_error: None,
                 pending,
                 focus: cx.focus_handle(),
@@ -835,6 +844,88 @@ mod app {
             if let Some(monitor) = monitor {
                 self.select_monitor(monitor);
             }
+        }
+
+        /// Keeps the viewer and a shown host window the same size, when enabled. The host's
+        /// window resizing (or being picked) resizes the viewer to show it 1:1; the user
+        /// resizing the viewer resizes the host window once the drag settles. Changes the
+        /// viewer makes itself are never sent back, so the two cannot chase each other.
+        fn sync_window_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let status = self.shared.status();
+            let Some(shown) = status
+                .window
+                .as_ref()
+                .filter(|w| status.connected && !status.window_closed && !w.minimized)
+            else {
+                self.size_sync.fitted = None;
+                return;
+            };
+            let p = *self.placement.lock().expect("placement poisoned");
+            if p.width <= 0 || p.height <= 0 {
+                return;
+            }
+            let area = (p.width.cast_unsigned(), p.height.cast_unsigned());
+            let sync = &mut self.size_sync;
+            let now = Instant::now();
+            if !self.config.match_window_size || window.is_fullscreen() || window.is_maximized() {
+                sync.last_area = area;
+                sync.pending = false;
+                sync.fitted = None;
+                return;
+            }
+            if sync.fitted.is_none() {
+                // Newly shown window (or matching just switched on): the viewer's current
+                // size is where we start, not a resize to pass on.
+                sync.last_area = area;
+                sync.pending = false;
+            }
+            if area != sync.last_area {
+                sync.last_area = area;
+                if sync.self_resize_until.is_none_or(|t| now >= t) {
+                    sync.changed_at = Some(now);
+                    sync.pending = true;
+                }
+            }
+            let remote = (shown.bounds.width, shown.bounds.height);
+            if sync.pending {
+                if sync
+                    .changed_at
+                    .is_some_and(|t| now.duration_since(t) >= RESIZE_SETTLE)
+                {
+                    sync.pending = false;
+                    sync.fitted = Some((shown.id, area));
+                    if !near(area, remote) {
+                        tracing::debug!(?area, ?remote, "resizing host window to the viewer");
+                        self.shared.resize_window(area.0, area.1);
+                    }
+                }
+                return;
+            }
+            if sync.fitted == Some((shown.id, remote)) {
+                return;
+            }
+            sync.fitted = Some((shown.id, remote));
+            if near(area, remote) {
+                return;
+            }
+            // Fit the video area to the window at 1:1, within the local display.
+            let scale = window.scale_factor();
+            let mut w = remote.0 as f32 / scale;
+            let mut h = remote.1 as f32 / scale + BAR_PX;
+            if let Some(display) = window.display(cx) {
+                let d = display.bounds().size;
+                w = w.min(f32::from(d.width) - 16.0);
+                h = h.min(f32::from(d.height) - 80.0);
+            }
+            tracing::debug!(?area, ?remote, w, h, "resizing viewer to the host window");
+            sync.self_resize_until = Some(now + SELF_RESIZE_GRACE);
+            window.resize(size(px(w.max(200.0)), px(h.max(150.0))));
+        }
+
+        fn toggle_match_size(&mut self) {
+            self.config.match_window_size = !self.config.match_window_size;
+            self.config.save();
+            self.size_sync = SizeSync::default();
         }
 
         fn toggle_picker(&mut self) {
@@ -1539,6 +1630,25 @@ mod app {
     }
 
     /// Translates a GPUI mouse button to the protocol's.
+    /// State for keeping the viewer and a shown host window the same size.
+    #[derive(Debug, Default)]
+    struct SizeSync {
+        /// Video area (physical pixels) as last seen.
+        last_area: (u32, u32),
+        /// The user changed the video area and it has not been sent yet.
+        pending: bool,
+        changed_at: Option<Instant>,
+        /// Until then, video-area changes come from the viewer's own resize.
+        self_resize_until: Option<Instant>,
+        /// The window and remote size the two were last matched at.
+        fitted: Option<(peet_proto::WindowId, (u32, u32))>,
+    }
+
+    /// Sizes within a couple of pixels count as equal (DPI rounding).
+    fn near(a: (u32, u32), b: (u32, u32)) -> bool {
+        a.0.abs_diff(b.0) <= 2 && a.1.abs_diff(b.1) <= 2
+    }
+
     /// `title` cut to at most `max` characters, with an ellipsis when cut.
     fn short_title(title: &str, max: usize) -> String {
         if title.chars().count() <= max {
@@ -1594,6 +1704,9 @@ mod app {
                 }
             }
             self.update_status();
+            if self.mode == Mode::Remote && self.screen == Screen::Session {
+                self.sync_window_size(window, cx);
+            }
             if self.mode == Mode::Remote {
                 let wanted = match self.screen {
                     Screen::Home => "PeetConnect".to_string(),
@@ -1676,7 +1789,7 @@ mod app {
             let show_bar =
                 !in_session || !fullscreen || !connected || self.pointer_y < REVEAL_BAR_PX;
             let mut bar = div()
-                .h(px(26.0))
+                .h(px(BAR_PX))
                 .px_2()
                 .flex()
                 .items_center()
@@ -1723,6 +1836,14 @@ mod app {
                         label,
                         !on_monitors || self.picker_open,
                         cx.listener(|this, _, _, _| this.toggle_picker()),
+                    ));
+                }
+                if s.connected && s.window.is_some() {
+                    bar = bar.child(Self::chip(
+                        ("mon", 96),
+                        "match size".into(),
+                        self.config.match_window_size,
+                        cx.listener(|this, _, _, _| this.toggle_match_size()),
                     ));
                 }
                 if s.connected && (s.monitors.len() > 1 || s.windows_supported) {

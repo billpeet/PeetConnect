@@ -65,6 +65,17 @@ enum Command {
         #[arg(long)]
         pin: Option<String>,
     },
+    /// Resize a host window's visible area, keeping its top-left corner.
+    Resize {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        /// Window ID (see `windows`, decimal or 0x hex) or a unique title substring.
+        window: String,
+        /// New visible size, e.g. `1280x800`.
+        size: String,
+        #[arg(long)]
+        pin: Option<String>,
+    },
     /// Capture a monitor or a single window of a PeetConnect host to a PNG file.
     Screenshot {
         /// Host name, MagicDNS name or IP, with optional :port.
@@ -324,6 +335,35 @@ async fn main() -> Result<()> {
                         w.title
                     );
                 }
+            }
+        }
+        Command::Resize {
+            host,
+            window,
+            size,
+            pin,
+        } => {
+            let (width, height) = size
+                .split_once('x')
+                .and_then(|(w, h)| {
+                    Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+                })
+                .context("size must look like 1280x800")?;
+            let session = open_session(&host, pin).await?;
+            require_windows(&session)?;
+            let target = find_window(&session.control(), &window).await?;
+            session
+                .control()
+                .resize_window(target.id, width, height)
+                .await?;
+            // Fire-and-forget: give the request a moment to leave before closing.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            session.close("done");
+            if !cli.json {
+                eprintln!(
+                    "resized {:#x} {} to {width}x{height}",
+                    target.id.0, target.title
+                );
             }
         }
         Command::Focus { host, window, pin } => {

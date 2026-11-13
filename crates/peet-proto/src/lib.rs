@@ -289,6 +289,14 @@ pub enum ControlMessage {
     FocusWindow {
         window: WindowId,
     },
+    /// Viewer asks the host to resize a window so its visible bounds (as in
+    /// [`WindowInfo::bounds`]) are `width` x `height`, keeping its top-left corner. A maximised
+    /// window is restored first. The result arrives as `WindowChanged::Bounds`.
+    ResizeWindow {
+        window: WindowId,
+        width: u32,
+        height: u32,
+    },
     /// Host-side stream statistics, sent about once a second per active stream.
     StreamStats {
         source: SourceId,
