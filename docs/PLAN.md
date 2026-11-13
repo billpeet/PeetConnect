@@ -301,6 +301,27 @@ hand-started `--session-worker` with `ProgramData` redirected read the machine f
 `logs\host.log` and reported both paths over the pipe. Not verified: an elevated install and the
 real service (no administrator on either test machine).
 
+*Work item 3 (2026-11-13)* — `packaging/peetconnect.iss` (Inno Setup 6.7) and `cargo xtask dist`
+(release build of the four shipped binaries, `target/dist/stage`, a portable zip via bsdtar, and
+ISCC with the workspace version; `--no-build`, `--no-installer`; CI runs the latter). Installer:
+8.6 MB. Per-user by default, per-machine through Inno's install-mode dialog; tasks for sign-in
+start (the tray's own Run value), PATH (HKCU or HKLM `Environment`, removed exactly on
+uninstall) and, per-machine only, the service with an allowed-logins/PIN page (or
+`/ALLOWUSERS=` and `/PIN=` silently) that is skipped when `host.toml` already exists. Before
+copying, it posts `WM_CLOSE` to the tray window (which stops the host it started) and stops the
+service; Restart Manager (`CloseApplications=force`) handles anything else. `/UPDATE` keeps earlier
+choices and does not re-apply tasks, so a sign-in entry turned off in the tray stays off. A
+per-machine install offers to remove a per-user copy first; a per-user install refuses while a
+per-machine one exists. It offers the Tailscale download page when Tailscale is missing.
+Uninstall stops the tray and service, removes the service, the Run value (when it points at this
+install) and the PATH entry, and asks before deleting settings. The tray now handles
+`WM_ENDSESSION` by stopping its host before it exits. Verified per-user on the dev box, all
+silent: fresh install over a running dev tray (closed, installed tray relaunched, files,
+shortcuts, Run value, PATH, uninstall key), `/UPDATE` over the running installed tray (closed
+before Restart Manager looked, relaunched, removed Run value not restored), uninstall (folder,
+key, shortcuts, Run value and PATH exactly restored, `host.toml` kept). Not verified: the
+interactive wizard pages and the per-machine mode with the service (no administrator).
+
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.
 

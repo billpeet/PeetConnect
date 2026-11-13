@@ -61,8 +61,9 @@ could swap the installer between verification and launch, and the service would 
   - Per-machine only: install the unattended-access service. This adds a page for the first
     allowed user (pre-filled from `tailscale status --json`) and an optional PIN, and writes
     `%ProgramData%\PeetConnect\host.toml`.
-- **Running processes:** the installer closes the tray, viewer and console host through Restart
-  Manager (`CloseApplications=yes`) and stops the service before copying files. Afterwards it
+- **Running processes:** the installer posts `WM_CLOSE` to the tray (which stops the console host
+  it started) and stops the service before copying files; Restart Manager
+  (`CloseApplications=force`) closes anything else, such as an open viewer. Afterwards it
   starts the service again and relaunches the tray if it had been running, passing
   `--updated <old version>` after an update.
 - **Uninstall:** stops the tray and host, removes the service, the PATH entry and the Run key.

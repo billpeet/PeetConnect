@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TrackPopupMenu, TranslateMessage, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED,
     MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXICON, SM_CXSMICON, TPM_BOTTOMALIGN, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU,
-    WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSW,
+    WM_DESTROY, WM_ENDSESSION, WM_NULL, WM_TIMER, WNDCLASSW,
 };
 
 use crate::host;
@@ -315,6 +315,14 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                 }
             });
             LRESULT(0)
+        }
+        // Sign-out, shutdown, or Restart Manager closing us for an install: the process may be
+        // terminated as soon as this returns, so stop the host we own now, not after the loop.
+        WM_ENDSESSION if wparam.0 != 0 => {
+            if let Some(mut app) = APP.with(|slot| slot.try_borrow_mut().ok()?.take()) {
+                app.shutdown();
+            }
+            std::process::exit(0);
         }
         WM_DESTROY => {
             // SAFETY: ends this thread's message loop.

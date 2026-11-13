@@ -26,3 +26,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
       - run: cargo build --workspace --release
+      # Stage and zip what would ship, so packaging breakage shows before a release.
+      - if: runner.os == 'Windows'
+        run: cargo xtask dist --no-build --no-installer

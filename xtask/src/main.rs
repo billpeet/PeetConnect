@@ -5,6 +5,10 @@
 //!   `assets/icon-256.png` for places that want a bitmap, and the tray state icons
 //!   (`assets/tray-active.ico`, `tray-paused.ico`, `tray-offline.ico`) derived from the flat
 //!   artwork.
+//! - `dist`: build the release binaries, then stage, zip and build the installer
+//!   (see `dist.rs`).
+
+mod dist;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,10 +31,11 @@ const BADGE_ACTIVE: &str =
 const BADGE_PAUSED: &str = r##"<circle cx="200" cy="200" r="50" fill="#f59e0b" stroke="#ffffff" stroke-width="16"/><rect x="180" y="178" width="14" height="44" rx="3" fill="#ffffff"/><rect x="206" y="178" width="14" height="44" rx="3" fill="#ffffff"/>"##;
 
 fn main() -> Result<()> {
-    let task = std::env::args().nth(1);
-    match task.as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
         Some("icons") => icons(),
-        _ => bail!("usage: cargo xtask icons"),
+        Some("dist") => dist::dist(&args[1..]),
+        _ => bail!("usage: cargo xtask icons | dist [--no-build] [--no-installer]"),
     }
 }
 
