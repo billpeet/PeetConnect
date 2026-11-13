@@ -280,8 +280,13 @@ Not done: file transfer, per-monitor bitrate budgeting in all-monitors mode (eac
 stream keeps the full cap), remembering a PIN per host. Exit — replaces AnyDesk for personal use — is close for the viewer side; the service still
 needs an administrator to verify unattended use (neither test machine's user is one).
 
+**M7 — Packaging, releases and updates.** (planned) One Inno Setup installer for all binaries,
+per-user by default and per-machine with the service when run as administrator; tag-triggered
+release builds on GitHub Actions; a signed update manifest on GitHub Releases, applied
+automatically when idle. Plan: [PACKAGING.md](PACKAGING.md).
+
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
-Android viewer, signing + auto-update, distribution.
+Android viewer.
 
 ## Known hard parts
 
