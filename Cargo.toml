@@ -12,6 +12,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 peet-capture = { path = "crates/peet-capture" }
 peet-codec = { path = "crates/peet-codec" }
+peet-control = { path = "crates/peet-control" }
 peet-core = { path = "crates/peet-core" }
 peet-input = { path = "crates/peet-input" }
 peet-proto = { path = "crates/peet-proto" }
@@ -51,12 +52,14 @@ windows = { version = "0.62", features = [
   "Win32_Graphics_Gdi",
   "Win32_Media_MediaFoundation",
   "Win32_Security",
+  "Win32_Security_Authorization",
   "Win32_System_Com",
   "Win32_System_DataExchange",
   "Win32_System_Environment",
   "Win32_System_Memory",
   "Win32_System_LibraryLoader",
   "Win32_System_Ole",
+  "Win32_System_Registry",
   "Win32_System_RemoteDesktop",
   "Win32_System_Services",
   "Win32_System_StationsAndDesktops",
@@ -64,6 +67,7 @@ windows = { version = "0.62", features = [
   "Win32_System_Variant",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_HiDpi",
+  "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

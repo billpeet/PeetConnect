@@ -28,8 +28,24 @@ use std::path::{Path, PathBuf};
 /// Panics (failing the build) when called outside a build script or when the resource
 /// compiler fails.
 pub fn embed(description: &str) {
-    let icon = icon_path();
-    println!("cargo:rerun-if-changed={}", icon.display());
+    embed_with_icons(description, &[]);
+}
+
+/// [`embed`] plus extra icon resources: `(resource id, file name under assets/)`. IDs must
+/// not be 1, which is the app icon.
+///
+/// # Panics
+///
+/// As [`embed`], and when an icon file is missing.
+pub fn embed_with_icons(description: &str, extra: &[(u16, &str)]) {
+    let mut icons = vec![(1, asset_path("peetconnect.ico"))];
+    for &(id, file) in extra {
+        assert_ne!(id, 1, "icon resource 1 is the app icon");
+        icons.push((id, asset_path(file)));
+    }
+    for (_, path) in &icons {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -40,7 +56,7 @@ pub fn embed(description: &str) {
     let rc_path = out_dir.join("peetconnect.rc");
     fs::write(
         &rc_path,
-        resource_script(&icon, &name, &version, description),
+        resource_script(&icons, &name, &version, description),
     )
     .expect("write resource script");
 
@@ -49,29 +65,40 @@ pub fn embed(description: &str) {
         .expect("compile Windows resources");
 }
 
-/// `assets/peetconnect.ico`, found relative to this crate so callers need no paths.
-fn icon_path() -> PathBuf {
+/// A file in `assets/`, found relative to this crate so callers need no paths.
+fn asset_path(file: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/peetconnect.ico")
+        .join("../../assets")
+        .join(file)
         .canonicalize()
-        .expect("assets/peetconnect.ico exists (regenerate with `cargo xtask icons`)")
+        .unwrap_or_else(|_| panic!("assets/{file} exists (regenerate with `cargo xtask icons`)"))
+}
+
+/// A path as an rc string literal body: backslashes doubled, and canonicalize's `\\?\`
+/// prefix (which rc does not understand) removed.
+fn rc_path(path: &Path) -> String {
+    let path = path.display().to_string();
+    path.strip_prefix(r"\\?\")
+        .unwrap_or(&path)
+        .replace('\\', r"\\")
 }
 
 /// The `.rc` source. Numeric constants instead of `winver.h` names keep it independent
 /// of the SDK include path.
-fn resource_script(icon: &Path, name: &str, version: &str, description: &str) -> String {
+fn resource_script(
+    icons: &[(u16, PathBuf)],
+    name: &str,
+    version: &str,
+    description: &str,
+) -> String {
     let numeric = numeric_version(version);
-    // rc string literals: backslashes double, and canonicalize's `\\?\` prefix confuses rc.
-    let icon = icon.display().to_string();
-    let icon = icon
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&icon)
-        .replace('\\', r"\\");
     let mut rc = String::new();
+    for (id, path) in icons {
+        let _ = writeln!(rc, r#"{id} ICON "{}""#, rc_path(path));
+    }
     let _ = write!(
         rc,
-        r#"1 ICON "{icon}"
-
+        r#"
 1 VERSIONINFO
 FILEVERSION {numeric}
 PRODUCTVERSION {numeric}
@@ -131,12 +158,17 @@ mod tests {
     #[test]
     fn resource_script_escapes_icon_path() {
         let rc = resource_script(
-            Path::new(r"\\?\C:\src\assets\peetconnect.ico"),
+            &[
+                (1, PathBuf::from(r"\\?\C:\src\assets\peetconnect.ico")),
+                (2, PathBuf::from(r"C:\src\assets\tray-active.ico")),
+            ],
             "peet-viewer",
             "0.1.0",
             "PeetConnect Viewer",
         );
-        assert!(rc.starts_with(r#"1 ICON "C:\\src\\assets\\peetconnect.ico""#));
+        assert!(rc.starts_with(
+            "1 ICON \"C:\\\\src\\\\assets\\\\peetconnect.ico\"\n2 ICON \"C:\\\\src\\\\assets\\\\tray-active.ico\"\n"
+        ));
         assert!(rc.contains(r#"VALUE "OriginalFilename", "peet-viewer.exe""#));
         assert!(rc.contains("FILEVERSION 0,1,0,0"));
     }

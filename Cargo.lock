@@ -4120,6 +4120,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "peet-control"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "peet-core"
 version = "0.1.0"
 dependencies = [
@@ -4142,6 +4152,7 @@ dependencies = [
  "image",
  "peet-capture",
  "peet-codec",
+ "peet-control",
  "peet-input",
  "peet-proto",
  "peet-tailscale",
@@ -4203,6 +4214,18 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "peet-tray"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 7.0.0",
+ "peet-control",
+ "peet-winres",
+ "tokio",
+ "windows 0.62.2",
 ]
 
 [[package]]

@@ -28,10 +28,12 @@ See [docs/PLAN.md](docs/PLAN.md) for architecture, decisions and milestones.
 | `crates/peet-transport` | QUIC (quinn) endpoints, self-signed TLS, tagged framed streams. |
 | `crates/peet-core` | Client core: connect, handshake, control, video events, screenshots. Shared by viewer, CLI and (later) MCP. |
 | `crates/peet-codec` | H.264 encode (Media Foundation hardware/software, openh264 fallback) and decode (Media Foundation + DXVA), GPU colour conversion. |
+| `crates/peet-control` | Local control API of a running host: JSON lines over the `\\.\pipe\peetconnect-host` named pipe (status, sessions, notices; disconnect, pause, shutdown). |
 | `crates/peet-input` | Synthesises mouse and keyboard input with `SendInput`; layout-independent key table. |
 | `bins/peet` | Command line, and the `mcp` subcommand: an MCP server exposing hosts as agent tools. |
 | `bins/peet-bench` | Capture and encode benchmarks. |
 | `bins/peet-host` | Host: serves monitors to authorised tailnet viewers; injects input; runs as a console process or a LocalSystem service. |
+| `bins/peet-tray` | Notification-area app for the host: status icon, connected viewers, connect/disconnect notifications, disconnect, pause, start/stop host, start with Windows. |
 | `bins/peet-viewer` | GPUI viewer: home screen with tailnet devices, favourites and recents; `--connect <host>` for a direct session; `--loopback` test rig. |
 | `crates/peet-winres` | Build-script helper: embeds the app icon and version info in the Windows executables. |
 | `xtask` | Repository chores; `cargo xtask icons` regenerates `assets/peetconnect.ico` and `assets/icon-256.png` from the SVGs. |
@@ -133,6 +135,22 @@ argument. The tools are `peet_peers`, `peet_monitors`, `peet_screenshot` (return
 `peet_clipboard_set`. Each takes the target `host` (and an optional `pin`); coordinates are
 monitor-relative unless `absolute` is set. For a newline, send `peet_key` with `enter` rather
 than a `\n` in `peet_type`.
+
+### Tray app
+
+`peet-tray` sits in the notification area of the host machine. Launched, it starts a console host
+(windowless, logging to `%LOCALAPPDATA%\PeetConnect\host.log`) unless one is already running;
+`--no-host` only watches. The icon shows the state: red when accepting, a green dot while someone
+is viewing, an amber pause badge while paused, grey when no host is running. Its menu lists
+connected viewers (click one to disconnect it; the viewer is told and does not reconnect), and has
+Pause new connections, Start/Stop/Restart host, Open configuration (creates a commented
+`host.toml` if there is none), Open host log, Start with Windows (a per-user Run key) and Quit,
+which also stops a host the tray started. Windows notifications announce viewers connecting,
+leaving, and connections refused.
+
+The tray reads allow rules from `%APPDATA%\PeetConnect\host.toml`, not from flags, so set at
+least one `[allow]` rule there. It also works with the service: the service's worker serves the
+same control pipe, and the tray shows "(service)" and offers no Stop.
 
 ### Unattended access (Windows service)
 

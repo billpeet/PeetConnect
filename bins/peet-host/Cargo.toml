@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 peet-capture.workspace = true
 peet-input.workspace = true
 peet-codec.workspace = true
+peet-control.workspace = true
 peet-tailscale.workspace = true
 peet-transport.workspace = true
 image.workspace = true

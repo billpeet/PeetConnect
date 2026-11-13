@@ -1,7 +1,8 @@
 //! `peet-host`: serves this machine's screens to authorised tailnet viewers.
 //!
-//! Milestone 3 build: runs as a plain user process in the interactive session. The Windows
-//! service, secure-desktop capture and input injection arrive in milestone 4.
+//! Runs in the foreground (`--console`, also what the tray starts) or as a Windows service that
+//! launches a per-session worker. Either way the serving process exposes the local control
+//! pipe (`peet-control`) that `peet-tray` watches.
 
 // On other platforms the binary is a stub, so nothing below main is reachable.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -85,6 +86,7 @@ fn main() -> anyhow::Result<()> {
         tracing::info!(path = %path.display(), "loaded configuration");
     }
     let config = config::HostConfig::resolve(file, &cli);
+    let config_path = path.or_else(config::default_path);
     #[cfg(windows)]
     {
         if cli.install {
@@ -96,11 +98,11 @@ fn main() -> anyhow::Result<()> {
         if cli.service {
             return service::run_service();
         }
-        host::run(config)
+        host::run(config, config_path)
     }
     #[cfg(not(windows))]
     {
-        let _ = config;
+        let _ = (config, config_path);
         anyhow::bail!("peet-host currently supports Windows only")
     }
 }
@@ -109,6 +111,8 @@ fn main() -> anyhow::Result<()> {
 mod auth;
 #[cfg(windows)]
 mod clipboard;
+#[cfg(windows)]
+mod control;
 #[cfg(windows)]
 mod desktop;
 #[cfg(windows)]
@@ -122,6 +126,7 @@ mod stream;
 
 #[cfg(windows)]
 mod host {
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
@@ -133,9 +138,10 @@ mod host {
 
     use crate::auth::Authoriser;
     use crate::config::HostConfig;
+    use crate::control::ControlHub;
     use crate::session::{self, HostState};
 
-    pub fn run(config: HostConfig) -> Result<()> {
+    pub fn run(config: HostConfig, config_path: Option<PathBuf>) -> Result<()> {
         // Monitor bounds must be physical pixels, not scaled by our own DPI virtualisation.
         // SAFETY: plain Win32 call with a constant argument.
         let _ =
@@ -143,10 +149,10 @@ mod host {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(serve(config))
+        runtime.block_on(serve(config, config_path))
     }
 
-    async fn serve(config: HostConfig) -> Result<()> {
+    async fn serve(config: HostConfig, config_path: Option<PathBuf>) -> Result<()> {
         if !config.admits_anyone() {
             tracing::warn!(
                 "no allow rules configured: every connection will be rejected. \
@@ -177,11 +183,14 @@ mod host {
             pin = config.pin.is_some(), allow = ?config.allow, "peet-host listening"
         );
 
+        let listen = endpoint.local_addr()?.to_string();
         let state = Arc::new(HostState {
             auth: Authoriser::new(config.allow.clone()),
             config,
             next_session: AtomicU64::new(0),
+            hub: ControlHub::new(config_path),
         });
+        tokio::spawn(crate::control::serve(state.clone(), listen));
 
         loop {
             tokio::select! {
@@ -198,6 +207,10 @@ mod host {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("shutting down");
+                    break;
+                }
+                () = state.hub.shutdown.notified() => {
+                    tracing::info!("shutting down at the control client's request");
                     break;
                 }
             }

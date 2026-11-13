@@ -85,6 +85,9 @@ pub enum Event {
     Clipboard(String),
     /// The connection ended. No more events follow.
     Closed(String),
+    /// The host ended the session on purpose (someone at the host disconnected us), with its
+    /// reason. Unlike [`Event::Closed`], reconnecting would be wrong. No more events follow.
+    EndedByHost(String),
 }
 
 /// Resolves `host`, `host:port`, `ip`, or `[v6]:port` to a socket address, defaulting the
@@ -483,7 +486,10 @@ async fn control_reader(
                         let _ = waiter.send(text);
                     }
                 }
-                ControlMessage::Disconnect { reason } => break reason,
+                ControlMessage::Disconnect { reason } => {
+                    let _ = events.send(Event::EndedByHost(reason)).await;
+                    return;
+                }
                 ControlMessage::SetStream { .. }
                 | ControlMessage::RequestKeyframe { .. }
                 | ControlMessage::Screenshot(_)

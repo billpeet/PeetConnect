@@ -228,6 +228,8 @@ enum SessionEnd {
     Quit,
     /// The connection was lost; reconnect.
     Lost(String),
+    /// Someone at the host ended the session; do not reconnect.
+    EndedByHost(String),
 }
 
 /// Runs sessions back to back, reconnecting with backoff until the UI quits or the host
@@ -245,7 +247,7 @@ async fn session_loop(
         }
         shared.generation.fetch_add(1, Ordering::Relaxed);
         match session(&config, shared, frames.clone()).await {
-            Ok(SessionEnd::Quit) => return Ok(()),
+            Ok(SessionEnd::Quit | SessionEnd::EndedByHost(_)) => return Ok(()),
             Ok(SessionEnd::Lost(reason)) => {
                 ever_connected = true;
                 attempt = 0;
@@ -385,6 +387,7 @@ async fn session(
                         *shared.clipboard_in.lock().expect("clipboard poisoned") = Some(text);
                     }
                     Event::Closed(reason) => break SessionEnd::Lost(reason),
+                    Event::EndedByHost(reason) => break SessionEnd::EndedByHost(reason),
                 }
             }
             _ = rtt_tick.tick() => {
@@ -402,6 +405,7 @@ async fn session(
     let reason = match &end {
         SessionEnd::Quit => "disconnected".to_string(),
         SessionEnd::Lost(reason) => format!("disconnected: {reason}"),
+        SessionEnd::EndedByHost(reason) => format!("the host ended the session ({reason})"),
     };
     {
         let mut status = shared.status.lock().expect("status poisoned");
@@ -424,6 +428,7 @@ pub fn describe_error(err: &anyhow::Error) -> (String, Option<RejectReason>) {
             RejectReason::PinIncorrect => "wrong PIN",
             RejectReason::NotAuthorised => "the host does not allow your Tailscale identity",
             RejectReason::Busy => "the host is busy with another viewer",
+            RejectReason::Paused => "the host is not accepting new connections right now",
             RejectReason::NoCommonCodec => "no video codec in common with the host",
             RejectReason::UnsupportedProtocolVersion => {
                 "the host runs an incompatible PeetConnect version"

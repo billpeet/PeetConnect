@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::auth::Authoriser;
 use crate::config::HostConfig;
+use crate::control::ControlHub;
 use crate::stream::{MonitorStream, StreamParams};
 
 /// Shared across sessions.
@@ -25,6 +26,7 @@ pub struct HostState {
     pub config: HostConfig,
     pub auth: Authoriser,
     pub next_session: AtomicU64,
+    pub hub: ControlHub,
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,13 +37,22 @@ pub async fn run(state: Arc<HostState>, connection: quinn::Connection) {
         Ok(Some((session_id, send, recv, identity, monitors))) => {
             tracing::info!(%remote, session = session_id.0, who = %identity, "session started");
             let started = Instant::now();
-            if let Err(err) =
-                control_loop(&state, &connection, session_id, send, recv, monitors).await
-            {
-                tracing::info!(%remote, session = session_id.0, %err, "session ended");
-            } else {
-                tracing::info!(%remote, session = session_id.0, elapsed = ?started.elapsed(), "session ended");
-            }
+            let kick = state.hub.register(peet_control::SessionInfo {
+                id: session_id.0,
+                node: identity.node.clone(),
+                user: identity.user.clone(),
+                remote: remote.to_string(),
+                started_unix_ms: crate::control::now_unix_ms(),
+            });
+            let reason =
+                match control_loop(&state, &connection, session_id, send, recv, monitors, &kick)
+                    .await
+                {
+                    Ok(reason) => reason.to_string(),
+                    Err(err) => format!("{err:#}"),
+                };
+            tracing::info!(%remote, session = session_id.0, %reason, elapsed = ?started.elapsed(), "session ended");
+            state.hub.unregister(session_id.0, reason);
         }
         Ok(None) => {}
         Err(err) => tracing::warn!(%remote, %err, "handshake failed"),
@@ -77,6 +88,9 @@ async fn handshake(state: &HostState, connection: &quinn::Connection) -> Result<
         Ok(identity) => identity,
         Err(denied) => {
             tracing::warn!(%remote, client = %hello.client_name, %denied, "rejected");
+            state
+                .hub
+                .rejected(remote.ip().to_string(), &format!("not allowed: {denied}"));
             return reject(&mut send, connection, RejectReason::NotAuthorised).await;
         }
     };
@@ -89,11 +103,19 @@ async fn handshake(state: &HostState, connection: &quinn::Connection) -> Result<
         )
         .await;
     }
+    if state.hub.paused() {
+        tracing::info!(%remote, who = %identity, "rejected: connections are paused");
+        state
+            .hub
+            .rejected(identity.to_string(), "new connections are paused");
+        return reject(&mut send, connection, RejectReason::Paused).await;
+    }
     if let Some(pin) = &state.config.pin {
         match &hello.pin {
             None => return reject(&mut send, connection, RejectReason::PinRequired).await,
             Some(offered) if !constant_time_eq(offered.as_bytes(), pin.as_bytes()) => {
                 tracing::warn!(%remote, who = %identity, "wrong PIN");
+                state.hub.rejected(identity.to_string(), "wrong PIN");
                 return reject(&mut send, connection, RejectReason::PinIncorrect).await;
             }
             Some(_) => {}
@@ -146,7 +168,8 @@ async fn control_loop(
     mut send: FramedSend,
     mut recv: FramedRecv,
     monitors: Vec<MonitorDesc>,
-) -> Result<()> {
+    kick: &tokio::sync::Notify,
+) -> Result<&'static str> {
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMessage>(256);
     let mut streams: HashMap<MonitorId, MonitorStream> = HashMap::new();
     let session_start = Instant::now();
@@ -248,7 +271,7 @@ async fn control_loop(
                     }
                     ControlMessage::Disconnect { reason } => {
                         tracing::info!(session = session_id.0, %reason, "viewer disconnected");
-                        break;
+                        return Ok("viewer disconnected");
                     }
                     ControlMessage::Cursor(_)
                     | ControlMessage::MonitorsChanged { .. }
@@ -260,16 +283,25 @@ async fn control_loop(
                 }
             }
             outgoing = ctl_rx.recv() => {
-                let Some(msg) = outgoing else { break };
+                let Some(msg) = outgoing else { return Ok("control channel closed") };
                 send.send(&msg).await?;
+            }
+            () = kick.notified() => {
+                drop(streams);
+                send.send(&ControlMessage::Disconnect {
+                    reason: "disconnected by the person at the host".into(),
+                })
+                .await?;
+                let _ = send.finish();
+                // Let the message reach the viewer before the connection is closed.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return Ok("disconnected at the host");
             }
             () = connection.closed_signal() => {
                 anyhow::bail!("connection closed");
             }
         }
     }
-    drop(streams);
-    Ok(())
 }
 
 /// Sets the flag when dropped, so the watcher thread exits with the control loop.

@@ -510,7 +510,7 @@ impl HostSlot {
             // when this task ends or is aborted.
             let _guard = guard;
             while let Some(event) = events.recv().await {
-                if matches!(event, Event::Closed(_)) {
+                if matches!(event, Event::Closed(_) | Event::EndedByHost(_)) {
                     break;
                 }
             }

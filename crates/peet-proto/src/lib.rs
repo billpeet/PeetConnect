@@ -143,6 +143,8 @@ pub enum RejectReason {
     PinIncorrect,
     NoCommonCodec,
     Busy,
+    /// Someone at the host has paused new connections.
+    Paused,
 }
 
 /// Reply to [`ClientHello`], host to viewer.
