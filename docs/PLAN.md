@@ -431,8 +431,8 @@ Alt to get past the foreground lock when needed. Window screenshots go through W
 checks `IsWindow` whenever an acquire times out. Client: `peet-core` `list_windows`,
 `focus_window`, and `set_stream`/`request_keyframe`/`screenshot` take `impl Into<SourceId>`;
 CLI `peet windows`, `peet focus <window>`, `peet screenshot --window <id|title>`; MCP
-`peet_windows`, `peet_focus_window`, `peet_screenshot { window }`. The viewer speaks v2 but still
-streams monitors only (item 5). `peet-bench testwindow` (hidden) opens a titled window that
+`peet_windows`, `peet_focus_window`, `peet_screenshot { window }`. The viewer spoke v2 but
+streamed monitors only until item 5. `peet-bench testwindow` (hidden) opens a titled window that
 moves, resizes, minimises, restores and closes itself on a schedule.
 
 Verified against a loopback test host with a throwaway client probe: the test window listed,
@@ -444,6 +444,25 @@ from another process returned the window's own content; `peet focus` on the mini
 restored it and took the foreground from another app. MCP: tools listed, `peet_windows` returned
 16 windows, `peet_screenshot { window: "Task Manager" }` returned a PNG. Compatibility: v0.2.0
 viewers and hosts cannot talk to this build; ship host and viewer together.
+
+*Work item 5 (2026-11-13)* — viewer. The presenter lays out `View`s (a source and its desktop
+bounds) instead of monitors, so a window is one letterboxed tile and pointer mapping and the
+cursor overlay work unchanged (the host's cursor positions are desktop coordinates). The bar
+gets a "window ▾" chip (Ctrl+Alt+W) opening a list of host windows (title, process, minimised);
+picking one stops the monitor streams and starts the window's; the monitor chips, or "desktop"
+on a single-monitor host, go back. `WindowChanged` keeps the shown window's bounds current, and
+the UI maps the pointer with those bounds, since a dragged window may send no new frame. A
+minimised window gets a card with "restore" (sends `FocusWindow`); a closed one gets "show
+desktop". Both offer "pick another window". While a window is shown, any click, key or wheel
+event first sends `FocusWindow`, at most every 2 s. The host ignores it when the foreground
+window belongs to the same process, so an open menu or dialog is not dismissed. The viewer
+title mirrors the remote window's title. `peet-viewer --window <id|title>` opens straight onto a
+window, and reconnects return to the shown window. Verified with `peet-bench testwindow` and
+`--window`: the stream showed, a move and a resize were followed, the minimised card appeared and
+cleared on restore, and the closed card appeared. Not yet exercised by hand: clicking through
+the picker, and input into a window stream. Seen: the host sent only 1–5 fps of the animated
+test window while the viewer covered it, against ~26 fps in the earlier probe. Check whether DWM
+throttles covered windows, or whether it was the debug build.
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.

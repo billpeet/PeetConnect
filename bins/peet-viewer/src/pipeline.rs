@@ -191,7 +191,7 @@ impl Sink {
         match self {
             Sink::Gpui(readback) => readback.deliver(frame, captured_at),
             Sink::D3d(presenter, info) => {
-                presenter.present(info.id, frame, std::slice::from_ref(info))
+                presenter.present(info.id.into(), frame, &[crate::present::View::from(&*info)])
             }
         }
     }

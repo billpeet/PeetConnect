@@ -10,7 +10,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow, SetForegroundWindow,
+    ShowWindow, SW_RESTORE,
 };
 
 /// Restores `id` if minimised and makes it the foreground window.
@@ -23,6 +24,10 @@ pub fn focus(id: u64) -> Result<(), String> {
         }
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else if same_process(GetForegroundWindow(), hwnd) {
+            // Already in front, or one of its own popups (a menu, a dialog) is: leave it, so
+            // an open menu is not dismissed before the click meant for it arrives.
+            return Ok(());
         }
         if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
             return Ok(());
@@ -36,6 +41,16 @@ pub fn focus(id: u64) -> Result<(), String> {
             Err("Windows refused to bring the window to the front".into())
         }
     }
+}
+
+fn same_process(a: HWND, b: HWND) -> bool {
+    let (mut pa, mut pb) = (0u32, 0u32);
+    // SAFETY: plain queries; a null or stale handle leaves the id at zero.
+    unsafe {
+        GetWindowThreadProcessId(a, Some(&mut pa));
+        GetWindowThreadProcessId(b, Some(&mut pb));
+    }
+    pa != 0 && pa == pb
 }
 
 fn tap_alt() {

@@ -18,23 +18,35 @@ use peet_capture::windows::D3dDevice;
 use peet_codec::windows::MfH264Decoder;
 use peet_core::{ConnectOptions, Control, Event};
 use peet_proto::{
-    ControlMessage, CursorShape, InputEvent, MonitorId, MonitorInfo, RejectReason, SourceId,
-    VideoFrame,
+    ControlMessage, CursorShape, Feature, InputEvent, MonitorId, MonitorInfo, RejectReason,
+    SourceId, VideoFrame, WindowChange, WindowId, WindowInfo,
 };
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HWND;
 
-use crate::present::{Presenter, SharedPlacement, SharedTiles};
+use crate::present::{Presenter, SharedPlacement, SharedTiles, Tile, View};
 
 /// Everything the UI shows about the session.
 #[derive(Debug, Default, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent UI flags, not a state machine
 pub struct RemoteStatus {
     pub host_name: String,
     pub monitors: Vec<MonitorInfo>,
     pub current: Option<MonitorId>,
     /// Show every monitor at once, laid out as on the host.
     pub all_monitors: bool,
+    /// The host window being shown instead of monitors, kept current from the host's
+    /// `WindowChanged` reports. `current` remembers the monitor to go back to.
+    pub window: Option<WindowInfo>,
+    /// The shown window was closed on the host; its stream has ended.
+    pub window_closed: bool,
+    /// The host can stream single windows.
+    pub windows_supported: bool,
+    /// The host's windows as last listed, front to back.
+    pub windows: Vec<WindowInfo>,
+    /// A window list request is in flight.
+    pub windows_loading: bool,
     pub frame_size: (u32, u32),
     pub fps: f64,
     pub decode_ms: f64,
@@ -48,6 +60,28 @@ pub struct RemoteStatus {
     pub rejected: Option<RejectReason>,
     /// A session that once worked was lost and is being re-established.
     pub reconnecting: bool,
+}
+
+impl RemoteStatus {
+    /// What is on screen: the chosen window, every monitor, or the current monitor.
+    pub fn views(&self) -> Vec<View> {
+        if let Some(window) = &self.window {
+            return vec![window.into()];
+        }
+        self.monitors
+            .iter()
+            .filter(|m| self.all_monitors || Some(m.id) == self.current)
+            .map(View::from)
+            .collect()
+    }
+
+    /// The stream whose statistics the status bar shows.
+    pub fn main_source(&self) -> Option<SourceId> {
+        match &self.window {
+            Some(window) => Some(SourceId::Window(window.id)),
+            None => self.current.map(SourceId::Monitor),
+        }
+    }
 }
 
 /// Remote cursor, drawn by GPUI over the video.
@@ -80,7 +114,15 @@ pub struct RemoteShared {
     /// Set once the network thread has fully stopped (decoder released), so the UI may start
     /// another session against the same window.
     pub finished: AtomicBool,
+    /// Set by the UI to ask the network thread for a fresh window list.
+    pub refresh_windows: AtomicBool,
+    /// When the shown window was last asked to come to the front.
+    last_focus: Mutex<Option<Instant>>,
 }
+
+/// A window stream asks the host to bring its window forward before input, at most this often.
+/// The host does nothing when the window's app is already in front, so open menus survive.
+const FOCUS_EVERY: Duration = Duration::from_secs(2);
 
 impl RemoteShared {
     pub fn status(&self) -> RemoteStatus {
@@ -105,10 +147,95 @@ impl RemoteShared {
         self.clipboard_in.lock().expect("clipboard poisoned").take()
     }
 
-    /// Forwards an input event to the host, if connected. Returns false if dropped.
+    /// Forwards an input event to the host, if connected. Returns false if dropped. While a
+    /// window is shown, a click or keystroke first brings that window to the front, since
+    /// injected input goes to whatever is on top.
     pub fn send_input(&self, event: InputEvent) -> bool {
         let control = self.control.lock().expect("control poisoned").clone();
-        control.is_some_and(|c| c.send_input(event))
+        let Some(control) = control else { return false };
+        if !matches!(event, InputEvent::MouseMove { .. }) {
+            let window = self.status.lock().expect("status poisoned").window.clone();
+            if let Some(window) = window {
+                let mut last = self.last_focus.lock().expect("focus poisoned");
+                if last.is_none_or(|t| t.elapsed() >= FOCUS_EVERY) {
+                    *last = Some(Instant::now());
+                    control.try_send(ControlMessage::FocusWindow { window: window.id });
+                }
+            }
+        }
+        control.send_input(event)
+    }
+
+    /// Restores the shown window if minimised and brings it to the front.
+    pub fn focus_window(&self) {
+        let control = self.control.lock().expect("control poisoned").clone();
+        let window = self.status.lock().expect("status poisoned").window.clone();
+        if let (Some(control), Some(window)) = (control, window) {
+            *self.last_focus.lock().expect("focus poisoned") = Some(Instant::now());
+            control.try_send(ControlMessage::FocusWindow { window: window.id });
+        }
+    }
+
+    /// Asks the network thread for a fresh window list.
+    pub fn refresh_windows(&self) {
+        let mut status = self.status.lock().expect("status poisoned");
+        if status.windows_supported && !status.windows_loading {
+            status.windows_loading = true;
+            self.refresh_windows.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The presenter's tiles, with a shown window's tile moved to where the window is now: a
+    /// window dragged on the host may send no new frame, so the presenter's copy goes stale.
+    pub fn tiles(&self) -> Vec<Tile> {
+        let mut tiles = self.tiles.lock().expect("tiles poisoned").clone();
+        let window = self.status.lock().expect("status poisoned").window.clone();
+        if let Some(window) = window {
+            for tile in &mut tiles {
+                if tile.source == SourceId::Window(window.id) {
+                    tile.bounds = window.bounds;
+                }
+            }
+        }
+        tiles
+    }
+
+    /// Shows one host window instead of monitors.
+    pub fn select_window(&self, window: &WindowInfo) {
+        let control = self.control.lock().expect("control poisoned").clone();
+        let Some(control) = control else { return };
+        let disable: Vec<SourceId> = {
+            let mut status = self.status.lock().expect("status poisoned");
+            if status.window.as_ref().is_some_and(|w| w.id == window.id) && !status.window_closed {
+                return;
+            }
+            let disable = status
+                .views()
+                .into_iter()
+                .map(|v| v.source)
+                .filter(|&s| s != SourceId::Window(window.id))
+                .collect();
+            status.window = Some(window.clone());
+            status.window_closed = false;
+            disable
+        };
+        for previous in disable {
+            stream(&control, previous, false);
+        }
+        *self.last_focus.lock().expect("focus poisoned") = None;
+        stream(&control, SourceId::Window(window.id), true);
+    }
+
+    /// Stops a shown window's stream, if any. Returns whether one was shown.
+    fn leave_window(control: &Control, status: &mut RemoteStatus) -> bool {
+        let Some(window) = status.window.take() else {
+            return false;
+        };
+        if !status.window_closed {
+            stream(control, SourceId::Window(window.id), false);
+        }
+        status.window_closed = false;
+        true
     }
 
     /// Shows one monitor, stopping the streams of any others.
@@ -117,8 +244,14 @@ impl RemoteShared {
         let Some(control) = control else { return };
         let disable: Vec<MonitorId> = {
             let mut status = self.status.lock().expect("status poisoned");
-            if !status.all_monitors && status.current == Some(monitor) {
+            let left_window = Self::leave_window(&control, &mut status);
+            if !left_window && !status.all_monitors && status.current == Some(monitor) {
                 return;
+            }
+            if left_window {
+                // None of the monitors is streaming any more.
+                status.all_monitors = false;
+                status.current = None;
             }
             let disable = if status.all_monitors {
                 status
@@ -139,19 +272,9 @@ impl RemoteShared {
             disable
         };
         for previous in disable {
-            control.try_send(ControlMessage::SetStream {
-                source: SourceId::Monitor(previous),
-                enabled: false,
-                max_fps: None,
-                max_bitrate_kbps: None,
-            });
+            stream(&control, SourceId::Monitor(previous), false);
         }
-        control.try_send(ControlMessage::SetStream {
-            source: SourceId::Monitor(monitor),
-            enabled: true,
-            max_fps: None,
-            max_bitrate_kbps: None,
-        });
+        stream(&control, SourceId::Monitor(monitor), true);
     }
 
     /// Shows every monitor at once.
@@ -160,21 +283,45 @@ impl RemoteShared {
         let Some(control) = control else { return };
         let monitors: Vec<MonitorId> = {
             let mut status = self.status.lock().expect("status poisoned");
-            if status.all_monitors {
+            let left_window = Self::leave_window(&control, &mut status);
+            if status.all_monitors && !left_window {
                 return;
             }
             status.all_monitors = true;
             status.monitors.iter().map(|m| m.id).collect()
         };
         for monitor in monitors {
-            control.try_send(ControlMessage::SetStream {
-                source: SourceId::Monitor(monitor),
-                enabled: true,
-                max_fps: None,
-                max_bitrate_kbps: None,
-            });
+            stream(&control, SourceId::Monitor(monitor), true);
         }
     }
+}
+
+fn stream(control: &Control, source: SourceId, enabled: bool) {
+    control.try_send(ControlMessage::SetStream {
+        source,
+        enabled,
+        max_fps: None,
+        max_bitrate_kbps: None,
+    });
+}
+
+/// Finds a window by hex or decimal id, or by case-insensitive title substring (front-most
+/// match first).
+fn find_window(windows: &[WindowInfo], spec: &str) -> Option<WindowInfo> {
+    let id = spec.strip_prefix("0x").map_or_else(
+        || spec.parse().ok(),
+        |hex| u64::from_str_radix(hex, 16).ok(),
+    );
+    if let Some(id) = id {
+        if let Some(w) = windows.iter().find(|w| w.id == WindowId(id)) {
+            return Some(w.clone());
+        }
+    }
+    let needle = spec.to_lowercase();
+    windows
+        .iter()
+        .find(|w| w.title.to_lowercase().contains(&needle))
+        .cloned()
 }
 
 pub struct Config {
@@ -189,6 +336,8 @@ pub struct SessionConfig {
     pub target: String,
     pub pin: Option<String>,
     pub monitor: Option<u32>,
+    /// Window to show on the first connection: id or title substring.
+    pub window: Option<String>,
     pub fps: u32,
     pub bitrate_kbps: u32,
 }
@@ -305,13 +454,27 @@ async fn session(
     let (info, control, mut events, guard) = session.split();
 
     // After a reconnect, go back to what the user was watching.
-    let (wanted, all_monitors) = {
+    let (wanted, all_monitors, mut window, first) = {
         let status = shared.status();
         (
             status.current.map(|m| m.0).or(config.monitor),
             status.all_monitors,
+            status.window.clone().filter(|_| !status.window_closed),
+            !status.connected && !status.reconnecting,
         )
     };
+    let windows_supported = info.capabilities.features.contains(&Feature::WindowCapture);
+    if !windows_supported {
+        window = None;
+    }
+    if let (true, true, Some(spec)) = (first, windows_supported, &config.window) {
+        let windows = control.list_windows(Duration::from_secs(10)).await?;
+        window = Some(
+            find_window(&windows, spec)
+                .with_context(|| format!("no window on the host matches {spec:?}"))?,
+        );
+        shared.status.lock().expect("status poisoned").windows = windows;
+    }
     let monitor = info
         .monitors
         .iter()
@@ -324,15 +487,21 @@ async fn session(
         status.host_name.clone_from(&info.host_name);
         status.monitors.clone_from(&info.monitors);
         status.current = Some(monitor);
+        status.window.clone_from(&window);
+        status.window_closed = false;
+        status.windows_supported = windows_supported;
+        status.windows_loading = false;
         status.connected = true;
         status.reconnecting = false;
         status.message = String::new();
     }
     *shared.control.lock().expect("control poisoned") = Some(control.clone());
-    let wanted_streams: Vec<MonitorId> = if all_monitors {
-        info.monitors.iter().map(|m| m.id).collect()
+    let wanted_streams: Vec<SourceId> = if let Some(window) = &window {
+        vec![SourceId::Window(window.id)]
+    } else if all_monitors {
+        info.monitors.iter().map(|m| m.id.into()).collect()
     } else {
-        vec![monitor]
+        vec![monitor.into()]
     };
     for id in wanted_streams {
         control
@@ -377,13 +546,30 @@ async fn session(
                     }
                     Event::StreamStats { source, fps, bitrate_kbps, skipped } => {
                         let mut status = shared.status.lock().expect("status poisoned");
-                        if status.current.map(SourceId::Monitor) == Some(source) {
+                        if status.main_source() == Some(source) {
                             status.host_fps = fps;
                             status.kbps = bitrate_kbps;
                             status.skipped = skipped;
                         }
                     }
-                    Event::WindowChanged { .. } => {}
+                    Event::WindowChanged { window, change } => {
+                        let mut status = shared.status.lock().expect("status poisoned");
+                        let closed = matches!(change, WindowChange::Closed);
+                        if let Some(shown) = status.window.as_mut().filter(|w| w.id == window) {
+                            match change {
+                                WindowChange::Bounds(bounds) => shown.bounds = bounds,
+                                WindowChange::Minimized => shown.minimized = true,
+                                WindowChange::Restored => shown.minimized = false,
+                                WindowChange::Closed => {}
+                            }
+                            if closed {
+                                status.window_closed = true;
+                            }
+                        }
+                        if closed {
+                            status.windows.retain(|w| w.id != window);
+                        }
+                    }
                     Event::Clipboard(text) => {
                         tracing::info!(chars = text.chars().count(), "clipboard received from host");
                         *shared.clipboard_in.lock().expect("clipboard poisoned") = Some(text);
@@ -399,6 +585,18 @@ async fn session(
             _ = quit_tick.tick() => {
                 if shared.quit.load(Ordering::Relaxed) {
                     break SessionEnd::Quit;
+                }
+                if shared.refresh_windows.swap(false, Ordering::Relaxed) {
+                    let (control, shared) = (control.clone(), shared.clone());
+                    tokio::spawn(async move {
+                        let result = control.list_windows(Duration::from_secs(5)).await;
+                        let mut status = shared.status.lock().expect("status poisoned");
+                        status.windows_loading = false;
+                        match result {
+                            Ok(windows) => status.windows = windows,
+                            Err(err) => tracing::warn!(%err, "could not list host windows"),
+                        }
+                    });
                 }
             }
         }
@@ -457,7 +655,7 @@ fn shape_image(shape: CursorShape) -> Option<Arc<RenderImage>> {
     ))))
 }
 
-/// Decoder state for one monitor's stream.
+/// Decoder state for one stream.
 struct Dec {
     decoder: MfH264Decoder,
     size: (u32, u32),
@@ -485,35 +683,22 @@ fn decode_loop(
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now)
     };
-    let mut decoders: HashMap<MonitorId, Dec> = HashMap::new();
-    let mut last_keyframe_request: HashMap<MonitorId, Instant> = HashMap::new();
+    let mut decoders: HashMap<SourceId, Dec> = HashMap::new();
+    let mut last_keyframe_request: HashMap<SourceId, Instant> = HashMap::new();
     let mut period = Instant::now();
     let mut frames_in_period: u32 = 0;
     let mut decode_time = Duration::ZERO;
     let mut generation = shared.generation.load(Ordering::Relaxed);
 
     while let Some(frame) = frames.blocking_recv() {
-        // The viewer streams monitors only so far; window streams arrive in M8 item 5.
-        let SourceId::Monitor(frame_monitor) = frame.source else {
-            continue;
-        };
-        let (visible, current) = {
+        let frame_source = frame.source;
+        let (visible, main) = {
             let status = shared.status.lock().expect("status poisoned");
-            let visible: Vec<MonitorInfo> = if status.all_monitors {
-                status.monitors.clone()
-            } else {
-                status
-                    .monitors
-                    .iter()
-                    .filter(|m| Some(m.id) == status.current)
-                    .cloned()
-                    .collect()
-            };
-            (visible, status.current)
+            (status.views(), status.main_source())
         };
-        if !visible.iter().any(|m| m.id == frame_monitor) {
+        if !visible.iter().any(|v| v.source == frame_source) {
             // Tail of a stream we switched away from.
-            decoders.remove(&frame_monitor);
+            decoders.remove(&frame_source);
             continue;
         }
         // A reconnect restarts sequence numbers and may change the streams, so start clean.
@@ -525,21 +710,21 @@ fn decode_loop(
         let size = (frame.width, frame.height);
         // Compare against the size we created the decoder with, not the decoder's own
         // report: it switches to the coded size (1088 rows for 1080p) after the first frame.
-        if decoders.get(&frame_monitor).is_some_and(|d| d.size != size) {
-            decoders.remove(&frame_monitor);
+        if decoders.get(&frame_source).is_some_and(|d| d.size != size) {
+            decoders.remove(&frame_source);
         }
-        if let std::collections::hash_map::Entry::Vacant(slot) = decoders.entry(frame_monitor) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = decoders.entry(frame_source) {
             slot.insert(Dec {
                 decoder: MfH264Decoder::new(size.0, size.1, &device.device)?,
                 size,
                 last_seq: frame.seq.saturating_sub(1),
                 waiting_for_keyframe: true,
             });
-            if current == Some(frame_monitor) || visible.len() == 1 {
+            if main == Some(frame_source) || visible.len() == 1 {
                 shared.status.lock().expect("status poisoned").frame_size = size;
             }
         }
-        let dec = decoders.get_mut(&frame_monitor).expect("decoder ensured");
+        let dec = decoders.get_mut(&frame_source).expect("decoder ensured");
         let lost = frame.seq != dec.last_seq + 1 && frame.seq > dec.last_seq;
         dec.last_seq = frame.seq;
         if lost && !frame.keyframe {
@@ -550,9 +735,9 @@ fn decode_loop(
                 dec.waiting_for_keyframe = false;
             } else {
                 let since = last_keyframe_request
-                    .entry(frame_monitor)
+                    .entry(frame_source)
                     .or_insert_with(long_ago);
-                request_keyframe(shared, frame_monitor, since);
+                request_keyframe(shared, frame_source, since);
                 continue;
             }
         }
@@ -561,17 +746,17 @@ fn decode_loop(
             Ok(pictures) => pictures,
             Err(err) => {
                 tracing::warn!(%err, seq = frame.seq, "decode failed; waiting for a keyframe");
-                decoders.remove(&frame_monitor);
+                decoders.remove(&frame_source);
                 let since = last_keyframe_request
-                    .entry(frame_monitor)
+                    .entry(frame_source)
                     .or_insert_with(long_ago);
-                request_keyframe(shared, frame_monitor, since);
+                request_keyframe(shared, frame_source, since);
                 continue;
             }
         };
         decode_time += t0.elapsed();
         for picture in &pictures {
-            presenter.present(frame_monitor, picture, &visible)?;
+            presenter.present(frame_source, picture, &visible)?;
             frames_in_period += 1;
         }
         if period.elapsed() >= Duration::from_secs(1) {
@@ -591,14 +776,12 @@ fn decode_loop(
     Ok(())
 }
 
-fn request_keyframe(shared: &RemoteShared, monitor: MonitorId, last: &mut Instant) {
+fn request_keyframe(shared: &RemoteShared, source: SourceId, last: &mut Instant) {
     if last.elapsed() < Duration::from_millis(250) {
         return;
     }
     *last = Instant::now();
     if let Some(control) = shared.control.lock().expect("control poisoned").as_ref() {
-        control.try_send(ControlMessage::RequestKeyframe {
-            source: SourceId::Monitor(monitor),
-        });
+        control.try_send(ControlMessage::RequestKeyframe { source });
     }
 }
