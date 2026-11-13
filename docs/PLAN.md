@@ -330,7 +330,10 @@ marked prerelease). `cargo xtask release <version>` (version, lock file, CHANGEL
 `notes`. Update key generated 2026-11-13; private key kept outside the repository. Verified
 locally: manifest signed and verified with the real key, a wrong key rejected, the release command
 dry-run in a throwaway worktree (commit, tag, version, lock file, CHANGELOG, notes; older version
-refused). Not yet run on GitHub.
+refused). First run: `v0.2.0` (2026-11-13) built, smoke-tested and produced a draft release
+with the installer, zip, `latest.json(.sig)` and `SHA256SUMS`; the installer's hash and size
+matched the manifest. Decided the same day: openh264 stays out of release builds (see "Known hard
+parts").
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.
