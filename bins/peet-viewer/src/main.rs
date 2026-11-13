@@ -4,6 +4,12 @@
 //! connections; click one (or type an address) to connect. `--connect <host>` skips straight
 //! to a session. `--loopback` runs the milestone 2 rig (local capture, encode, decode and
 //! present), still the quickest way to measure the pipeline on one machine.
+//!
+//! It is a GUI-subsystem program, so the Start menu opens no console window. Started from a
+//! terminal it attaches to that console for `--help` and logs; otherwise it logs to
+//! `%LOCALAPPDATA%\PeetConnect\viewer.log`.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 // On other platforms the binary is a stub, so nothing below main is reachable.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -64,12 +70,19 @@ enum CaptureBackend {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    match log_file() {
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init(),
+    }
     let cli = Cli::parse();
     #[cfg(windows)]
     {
@@ -80,6 +93,42 @@ fn main() -> anyhow::Result<()> {
         let _ = cli;
         anyhow::bail!("peet-viewer currently supports Windows only")
     }
+}
+
+/// Where logs go when there is no console to write to. `None` means use stderr: either we
+/// attached to the terminal that started us, or stderr was redirected by whoever did.
+#[cfg(windows)]
+fn log_file() -> Option<std::fs::File> {
+    use windows::Win32::System::Console::{
+        AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+    };
+
+    // SAFETY: plain console calls without pointers.
+    let redirected =
+        unsafe { GetStdHandle(STD_ERROR_HANDLE) }.is_ok_and(|h| !h.is_invalid() && !h.0.is_null());
+    if redirected {
+        return None;
+    }
+    // SAFETY: as above. Fails when the parent has no console (Explorer, the Start menu).
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok() {
+        return None;
+    }
+    let dir = dirs::data_local_dir()?.join("PeetConnect");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("viewer.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 10 * 1024 * 1024) {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(windows))]
+fn log_file() -> Option<std::fs::File> {
+    None
 }
 
 #[cfg(windows)]
