@@ -2,7 +2,8 @@
 //!
 //! One borderless, topmost window per monitor repaints a bouncing block over a slowly
 //! cycling background at roughly 60 Hz. The windows close when the [`Stimulator`] drops.
-//! [`occluder`] opens a plain grey window on top, to test capture of covered windows.
+//! [`occluder`] opens a plain grey window on top, to test capture of covered windows, and
+//! [`test_window`] an ordinary titled, resizable animated window for single-window streams.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, OnceLock};
@@ -18,10 +19,20 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetMessageW, GetWindowLongPtrW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursorPos,
-    SetTimer, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, GWLP_USERDATA, MSG, WM_CLOSE,
-    WM_DESTROY, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    SetTimer, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, GWLP_USERDATA, MSG, WINDOW_EX_STYLE,
+    WM_CLOSE, WM_DESTROY, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Borderless topmost tool window with the bouncing block.
+    Animated,
+    /// Borderless topmost plain grey window.
+    Solid,
+    /// Ordinary titled, resizable window with the bouncing block.
+    Normal,
+}
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static TICK: AtomicU32 = AtomicU32::new(0);
@@ -57,11 +68,19 @@ impl Drop for Occluder {
 /// Opens a plain grey topmost window over the given desktop rectangle.
 pub fn occluder(x: i32, y: i32, w: i32, h: i32) -> Occluder {
     let (tx, rx) = mpsc::channel();
-    let thread = std::thread::spawn(move || window_thread(x, y, w, h, true, &tx));
+    let thread = std::thread::spawn(move || window_thread(x, y, w, h, Kind::Solid, &tx));
     Occluder {
         thread: Some(thread),
         hwnd: rx.recv().unwrap_or(0),
     }
+}
+
+/// Opens an ordinary titled, resizable animated window, "PeetConnect test window". Returns
+/// its message-loop thread, which ends when the window is closed, and its `HWND`.
+pub fn test_window(x: i32, y: i32, w: i32, h: i32) -> (JoinHandle<()>, u64) {
+    let (tx, rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || window_thread(x, y, w, h, Kind::Normal, &tx));
+    (thread, rx.recv().unwrap_or(0))
 }
 
 fn hwnd(id: u64) -> HWND {
@@ -82,7 +101,7 @@ pub fn start(monitors: &[MonitorDesc]) -> Stimulator {
         let y = b.y + (i32::try_from(b.height).unwrap_or(0) - h) / 2;
         let (tx, rx) = mpsc::channel();
         threads.push(std::thread::spawn(move || {
-            window_thread(x, y, w, h, false, &tx);
+            window_thread(x, y, w, h, Kind::Animated, &tx);
         }));
         hwnds.push(rx.recv().unwrap_or(0));
     }
@@ -132,7 +151,7 @@ fn register_class() -> u16 {
 }
 
 /// Runs one window's message loop. Sends the window handle (0 on failure) once created.
-fn window_thread(x: i32, y: i32, w: i32, h: i32, solid: bool, created: &mpsc::Sender<u64>) {
+fn window_thread(x: i32, y: i32, w: i32, h: i32, kind: Kind, created: &mpsc::Sender<u64>) {
     if register_class() == 0 {
         tracing::warn!("could not register stimulator window class");
         let _ = created.send(0);
@@ -142,11 +161,23 @@ fn window_thread(x: i32, y: i32, w: i32, h: i32, solid: bool, created: &mpsc::Se
     // window is destroyed from WM_TIMER.
     unsafe {
         let instance = GetModuleHandleW(None).unwrap_or_default();
+        let (ex_style, style, title) = match kind {
+            Kind::Normal => (
+                WINDOW_EX_STYLE(0),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                w!("PeetConnect test window"),
+            ),
+            Kind::Animated | Kind::Solid => (
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                WS_POPUP | WS_VISIBLE,
+                w!("peet-bench"),
+            ),
+        };
         let hwnd = match CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            ex_style,
             w!("PeetBenchStimulator"),
-            w!("peet-bench"),
-            WS_POPUP | WS_VISIBLE,
+            title,
+            style,
             x,
             y,
             w,
@@ -163,11 +194,11 @@ fn window_thread(x: i32, y: i32, w: i32, h: i32, solid: bool, created: &mpsc::Se
                 return;
             }
         };
-        if solid {
+        if kind == Kind::Solid {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 1);
         }
         let _ = created.send(hwnd.0 as usize as u64);
-        tracing::info!(?hwnd, x, y, w, h, solid, "stimulator window created");
+        tracing::info!(?hwnd, x, y, w, h, ?kind, "stimulator window created");
         SetTimer(Some(hwnd), 1, 16, None);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

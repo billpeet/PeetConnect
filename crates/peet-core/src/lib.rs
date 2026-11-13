@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use peet_proto::{
     Capabilities, ClientHello, Codec, ControlMessage, CursorUpdate, EncodedImage, Feature,
-    InputEvent, MonitorId, MonitorInfo, RejectReason, ScreenshotRequest, ScreenshotResult,
-    ServerHello, SessionId, StreamKind, VideoFrame, DEFAULT_PORT, PROTOCOL_VERSION,
+    InputEvent, MonitorInfo, RejectReason, ScreenshotRequest, ScreenshotResult, ServerHello,
+    SessionId, SourceId, StreamKind, VideoFrame, WindowChange, WindowId, WindowInfo, DEFAULT_PORT,
+    PROTOCOL_VERSION,
 };
 use peet_transport::{quinn, FramedRecv, FramedSend, TransportError};
 use tokio::sync::{mpsc, oneshot};
@@ -76,10 +77,15 @@ pub enum Event {
     Cursor(CursorUpdate),
     MonitorsChanged(Vec<MonitorInfo>),
     StreamStats {
-        monitor: MonitorId,
+        source: SourceId,
         fps: u16,
         bitrate_kbps: u32,
         skipped: u32,
+    },
+    /// A streamed window moved, was minimised or restored, or closed (its stream has ended).
+    WindowChanged {
+        window: WindowId,
+        change: WindowChange,
     },
     /// The host's clipboard changed to this text.
     Clipboard(String),
@@ -271,6 +277,7 @@ struct Shared {
     next_request: AtomicU64,
     screenshots: Mutex<HashMap<u64, oneshot::Sender<ScreenshotResult>>>,
     clipboard: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
+    windows: Mutex<HashMap<u64, oneshot::Sender<Vec<WindowInfo>>>>,
     pings: Mutex<HashMap<u64, Instant>>,
     rtt: Mutex<Option<Duration>>,
 }
@@ -297,15 +304,16 @@ impl Control {
         self.tx.try_send(msg).is_ok()
     }
 
+    /// Starts, restarts or stops the video stream of a monitor or window.
     pub async fn set_stream(
         &self,
-        monitor: MonitorId,
+        source: impl Into<SourceId>,
         enabled: bool,
         max_fps: Option<u16>,
         max_bitrate_kbps: Option<u32>,
     ) -> Result<(), ConnectError> {
         self.send(ControlMessage::SetStream {
-            monitor,
+            source: source.into(),
             enabled,
             max_fps,
             max_bitrate_kbps,
@@ -313,8 +321,41 @@ impl Control {
         .await
     }
 
-    pub async fn request_keyframe(&self, monitor: MonitorId) -> Result<(), ConnectError> {
-        self.send(ControlMessage::RequestKeyframe { monitor }).await
+    pub async fn request_keyframe(&self, source: impl Into<SourceId>) -> Result<(), ConnectError> {
+        self.send(ControlMessage::RequestKeyframe {
+            source: source.into(),
+        })
+        .await
+    }
+
+    /// Lists the host's capturable windows, front to back.
+    pub async fn list_windows(&self, timeout: Duration) -> Result<Vec<WindowInfo>, ConnectError> {
+        let request_id = self.shared.next_request.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = oneshot::channel();
+        self.shared
+            .windows
+            .lock()
+            .expect("windows map poisoned")
+            .insert(request_id, tx);
+        self.send(ControlMessage::ListWindows { request_id })
+            .await?;
+        let result = tokio::time::timeout(timeout, rx).await;
+        self.shared
+            .windows
+            .lock()
+            .expect("windows map poisoned")
+            .remove(&request_id);
+        match result {
+            Ok(Ok(windows)) => Ok(windows),
+            Ok(Err(_)) => Err(ConnectError::Handshake("session closed".into())),
+            Err(_) => Err(ConnectError::Handshake("window list timed out".into())),
+        }
+    }
+
+    /// Asks the host to restore a window if minimised and bring it to the front, so input
+    /// reaches it. Fire-and-forget.
+    pub async fn focus_window(&self, window: WindowId) -> Result<(), ConnectError> {
+        self.send(ControlMessage::FocusWindow { window }).await
     }
 
     /// Queues an input event. Input has its own stream so it is never stuck behind control
@@ -336,7 +377,7 @@ impl Control {
     /// Requests a still image and waits for it.
     pub async fn screenshot(
         &self,
-        monitor: MonitorId,
+        source: impl Into<SourceId>,
         codec: Codec,
         max_width: Option<u32>,
         timeout: Duration,
@@ -350,7 +391,7 @@ impl Control {
             .insert(request_id, tx);
         self.send(ControlMessage::Screenshot(ScreenshotRequest {
             request_id,
-            monitor,
+            source: source.into(),
             codec,
             max_width,
         }))
@@ -453,13 +494,13 @@ async fn control_reader(
                     }
                 }
                 ControlMessage::StreamStats {
-                    monitor,
+                    source,
                     fps,
                     bitrate_kbps,
                     skipped,
                 } => {
                     let event = Event::StreamStats {
-                        monitor,
+                        source,
                         fps,
                         bitrate_kbps,
                         skipped,
@@ -486,11 +527,35 @@ async fn control_reader(
                         let _ = waiter.send(text);
                     }
                 }
+                ControlMessage::Windows {
+                    request_id,
+                    windows,
+                } => {
+                    let waiter = shared
+                        .windows
+                        .lock()
+                        .expect("windows map poisoned")
+                        .remove(&request_id);
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(windows);
+                    }
+                }
+                ControlMessage::WindowChanged { window, change } => {
+                    if events
+                        .send(Event::WindowChanged { window, change })
+                        .await
+                        .is_err()
+                    {
+                        break "consumer gone".to_string();
+                    }
+                }
                 ControlMessage::Disconnect { reason } => {
                     let _ = events.send(Event::EndedByHost(reason)).await;
                     return;
                 }
                 ControlMessage::SetStream { .. }
+                | ControlMessage::ListWindows { .. }
+                | ControlMessage::FocusWindow { .. }
                 | ControlMessage::RequestKeyframe { .. }
                 | ControlMessage::Screenshot(_)
                 | ControlMessage::SetClipboard { .. }

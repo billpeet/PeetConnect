@@ -73,6 +73,11 @@ enum Command {
         #[arg(long)]
         no_write: bool,
     },
+    /// Internal: open an ordinary animated window titled "PeetConnect test window" on the
+    /// primary monitor that moves (2 s), resizes (4 s), minimises (6 s), restores (8 s) and
+    /// closes itself (10 s), for testing window streams end to end.
+    #[command(hide = true)]
+    Testwindow,
     /// Internal: show a grey topmost window over a rectangle until killed (used by `window
     /// --occlude`).
     #[command(hide = true)]
@@ -172,7 +177,7 @@ mod win {
     use peet_codec::windows::{list_encoders, MfH264Encoder};
     use peet_codec::{EncoderConfig, EncoderKind, VideoEncoder};
     use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -263,6 +268,7 @@ mod win {
                 }
                 Ok(())
             }
+            Command::Testwindow => run_test_window(),
             Command::Occluder { x, y, w, h } => {
                 let _cover = super::stimulate::occluder(x, y, w, h);
                 // The parent kills us when the phase ends.
@@ -528,6 +534,44 @@ mod win {
             active,
             stats,
         })
+    }
+
+    fn run_test_window() -> Result<()> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE,
+        };
+        let primary = enumerate_monitors()?
+            .into_iter()
+            .find(|m| m.primary)
+            .ok_or_else(|| anyhow::anyhow!("no primary monitor"))?;
+        let (x0, y0) = (primary.bounds.x + 100, primary.bounds.y + 100);
+        let (thread, id) = super::stimulate::test_window(x0, y0, 800, 600);
+        anyhow::ensure!(id != 0, "could not create the test window");
+        let hwnd = HWND(usize::try_from(id).unwrap_or(0) as *mut core::ffi::c_void);
+        println!("{id:#x}");
+        let step = |at: u64, what: &str| {
+            std::thread::sleep(Duration::from_secs(at));
+            eprintln!("test window: {what}");
+        };
+        let place = |x, y, w, h| {
+            // SAFETY: plain window placement on our own window.
+            let _ = unsafe { SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) };
+        };
+        step(2, "move");
+        place(x0 + 200, y0 + 50, 800, 600);
+        step(2, "resize");
+        place(x0 + 200, y0 + 50, 1001, 701);
+        step(2, "minimise");
+        // SAFETY: as above.
+        let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+        step(2, "restore");
+        // SAFETY: as above.
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        step(2, "close");
+        // SAFETY: as above.
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        let _ = thread.join();
+        Ok(())
     }
 
     struct Scenario {

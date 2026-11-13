@@ -165,6 +165,8 @@ mod service;
 mod session;
 #[cfg(windows)]
 mod stream;
+#[cfg(windows)]
+mod window;
 
 #[cfg(windows)]
 mod host {

@@ -182,6 +182,11 @@ pub(crate) fn hwnd_from_id(id: u64) -> HWND {
     HWND(usize::try_from(id).unwrap_or(0) as *mut core::ffi::c_void)
 }
 
+pub(crate) fn exists(id: u64) -> bool {
+    // SAFETY: read-only query.
+    unsafe { IsWindow(Some(hwnd_from_id(id))) }.as_bool()
+}
+
 pub(crate) fn is_minimized(id: u64) -> bool {
     // SAFETY: read-only query.
     unsafe { IsIconic(hwnd_from_id(id)) }.as_bool()

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
-use peet_core::proto::{Codec, InputEvent, MonitorId, MouseButton};
+use peet_core::proto::{Codec, Feature, InputEvent, MonitorId, MouseButton, SourceId};
 use peet_core::{Control, Event, SessionInfo};
 use peet_tailscale::LocalApi;
 use serde_json::{json, Value};
@@ -28,6 +28,7 @@ use crate::virtual_point;
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(10);
+const WINDOWS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Grace after flushing input so the host receives and injects it before the next call.
 const INPUT_GRACE: Duration = Duration::from_millis(250);
 
@@ -166,11 +167,28 @@ fn tool_list() -> Vec<Value> {
             } },
         }),
         json!({
+            "name": "peet_windows",
+            "description": "List a host's application windows (id, title, process, geometry, minimised) for single-window screenshots.",
+            "inputSchema": { "type": "object", "required": ["host"], "properties": {
+                "host": host_prop(), "pin": { "type": "string" }
+            } },
+        }),
+        json!({
+            "name": "peet_focus_window",
+            "description": "Restore a host window if minimised and bring it to the front so clicks and keys reach it.",
+            "inputSchema": { "type": "object", "required": ["host", "window"], "properties": {
+                "host": host_prop(),
+                "window": { "type": "string", "description": "Window id (decimal or 0x hex) or a unique title substring" },
+                "pin": { "type": "string" }
+            } },
+        }),
+        json!({
             "name": "peet_screenshot",
-            "description": "Capture a host monitor as a PNG image. Returns the image.",
+            "description": "Capture a host monitor, or one window, as a PNG image. Returns the image. A window is captured even when other windows cover it, but not while minimised.",
             "inputSchema": { "type": "object", "required": ["host"], "properties": {
                 "host": host_prop(),
                 "monitor": { "type": "integer", "description": "Monitor id; default primary" },
+                "window": { "type": "string", "description": "Capture this window instead: id or unique title substring (see peet_windows)" },
                 "max_width": { "type": "integer", "description": "Downscale to at most this wide" },
                 "pin": { "type": "string" }
             } },
@@ -246,6 +264,8 @@ async fn call_tool(
     match name {
         "peet_peers" => tool_peers(args, api).await,
         "peet_monitors" => tool_monitors(args, sessions).await,
+        "peet_windows" => tool_windows(args, sessions).await,
+        "peet_focus_window" => tool_focus_window(args, sessions).await,
         "peet_screenshot" => tool_screenshot(args, sessions).await,
         "peet_move" => tool_move(args, sessions).await,
         "peet_click" => tool_click(args, sessions).await,
@@ -289,12 +309,62 @@ async fn tool_monitors(args: &Value, sessions: &Arc<Sessions>) -> Result<Vec<Val
     Ok(vec![text_content(&serde_json::to_string_pretty(&out)?)])
 }
 
+async fn tool_windows(args: &Value, sessions: &Arc<Sessions>) -> Result<Vec<Value>> {
+    let slot = sessions.acquire(args)?;
+    let windows = run(&slot, |control, info| async move {
+        require_windows(&info)?;
+        control.list_windows(WINDOWS_TIMEOUT).await
+    })
+    .await?;
+    let out: Vec<Value> = windows.iter().map(crate::window_json).collect();
+    Ok(vec![text_content(&serde_json::to_string_pretty(&out)?)])
+}
+
+async fn tool_focus_window(args: &Value, sessions: &Arc<Sessions>) -> Result<Vec<Value>> {
+    let spec = arg_str(args, "window")
+        .context("window is required")?
+        .to_owned();
+    let slot = sessions.acquire(args)?;
+    let windows = run(&slot, |control, info| async move {
+        require_windows(&info)?;
+        control.list_windows(WINDOWS_TIMEOUT).await
+    })
+    .await?;
+    let target = crate::pick_window(windows, &spec)?;
+    let id = target.id;
+    run(&slot, |control, _| async move {
+        control.focus_window(id).await?;
+        tokio::time::sleep(INPUT_GRACE).await;
+        Ok(())
+    })
+    .await?;
+    Ok(vec![text_content(&format!(
+        "focused {:#x} {}",
+        target.id.0, target.title
+    ))])
+}
+
 async fn tool_screenshot(args: &Value, sessions: &Arc<Sessions>) -> Result<Vec<Value>> {
     let monitor = arg_u32(args, "monitor");
+    let window = arg_str(args, "window").map(str::to_owned);
     let max_width = arg_u32(args, "max_width");
     let slot = sessions.acquire(args)?;
+    let source = match window {
+        Some(spec) => {
+            let windows = run(&slot, |control, info| async move {
+                require_windows(&info)?;
+                control.list_windows(WINDOWS_TIMEOUT).await
+            })
+            .await?;
+            Some(SourceId::Window(crate::pick_window(windows, &spec)?.id))
+        }
+        None => None,
+    };
     let image = run(&slot, |control, info| async move {
-        let target = pick_monitor(&info, monitor)?;
+        let target = match source {
+            Some(source) => source,
+            None => SourceId::Monitor(pick_monitor(&info, monitor)?),
+        };
         let img = control
             .screenshot(target, Codec::Png, max_width, SCREENSHOT_TIMEOUT)
             .await?;
@@ -588,6 +658,16 @@ async fn settle(control: &Control) {
 }
 
 // ---- argument + value helpers ----------------------------------------------------------------
+
+fn require_windows(info: &SessionInfo) -> Result<(), peet_core::ConnectError> {
+    if info.capabilities.features.contains(&Feature::WindowCapture) {
+        Ok(())
+    } else {
+        Err(peet_core::ConnectError::Handshake(
+            "this host cannot capture single windows".into(),
+        ))
+    }
+}
 
 fn pick_monitor(
     info: &SessionInfo,

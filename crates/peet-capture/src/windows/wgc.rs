@@ -293,6 +293,11 @@ impl WgcCapturer {
             }
             let now = Instant::now();
             if now >= deadline {
+                // `GraphicsCaptureItem.Closed` does not reliably fire for a closed window (seen
+                // on Windows 11 26H2 with a free-threaded pool), so check the handle as well.
+                if matches!(self.target, WgcTarget::Window(id) if !toplevel::exists(id)) {
+                    return Err(CaptureError::Closed);
+                }
                 return Err(CaptureError::Timeout);
             }
             self.signal.wait(deadline - now);

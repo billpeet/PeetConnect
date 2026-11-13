@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use peet_core::{ConnectOptions, Session};
-use peet_proto::{Codec, InputEvent, MouseButton};
+use peet_proto::{Codec, InputEvent, MouseButton, SourceId, WindowInfo};
 use peet_tailscale::{LocalApi, PeerStatus, Status};
 
 mod mcp;
@@ -49,13 +49,33 @@ enum Command {
         #[arg(long)]
         pin: Option<String>,
     },
-    /// Capture a monitor of a PeetConnect host to a PNG file.
+    /// List the windows of a PeetConnect host that can be captured on their own.
+    Windows {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Restore a host window if minimised and bring it to the front, so input reaches it.
+    Focus {
+        /// Host name, MagicDNS name or IP, with optional :port.
+        host: String,
+        /// Window ID (see `windows`, decimal or 0x hex) or a unique title substring.
+        window: String,
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Capture a monitor or a single window of a PeetConnect host to a PNG file.
     Screenshot {
         /// Host name, MagicDNS name or IP, with optional :port.
         host: String,
         /// Monitor ID (see `monitors`); default is the primary.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "window")]
         monitor: Option<u32>,
+        /// Capture one window instead: an ID (see `windows`) or a unique title substring.
+        /// Covered windows are captured as they look; minimised ones fail.
+        #[arg(long)]
+        window: Option<String>,
         /// Downscale so the image is at most this wide.
         #[arg(long)]
         max_width: Option<u32>,
@@ -277,31 +297,81 @@ async fn main() -> Result<()> {
             }
             session.close("done");
         }
+        Command::Windows { host, pin } => {
+            let session = open_session(&host, pin).await?;
+            require_windows(&session)?;
+            let windows = session
+                .control()
+                .list_windows(Duration::from_secs(10))
+                .await?;
+            session.close("done");
+            if cli.json {
+                print_json(&serde_json::json!(windows
+                    .iter()
+                    .map(window_json)
+                    .collect::<Vec<_>>()))?;
+            } else {
+                for w in &windows {
+                    println!(
+                        "  {:#010x}  {:>5}x{:<5} at {},{}{}  {:<24} {}",
+                        w.id.0,
+                        w.bounds.width,
+                        w.bounds.height,
+                        w.bounds.x,
+                        w.bounds.y,
+                        if w.minimized { "  minimised" } else { "" },
+                        w.process,
+                        w.title
+                    );
+                }
+            }
+        }
+        Command::Focus { host, window, pin } => {
+            let session = open_session(&host, pin).await?;
+            require_windows(&session)?;
+            let target = find_window(&session.control(), &window).await?;
+            session.control().focus_window(target.id).await?;
+            // Fire-and-forget: give the request a moment to leave before closing.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            session.close("done");
+            if cli.json {
+                print_json(&window_json(&target))?;
+            } else {
+                eprintln!("focused {:#x} {}", target.id.0, target.title);
+            }
+        }
         Command::Screenshot {
             host,
             monitor,
+            window,
             max_width,
             output,
             pin,
         } => {
             let session = open_session(&host, pin).await?;
             let info = session.info();
-            let target = match monitor {
-                Some(id) => info
-                    .monitors
-                    .iter()
-                    .find(|m| m.id.0 == id)
-                    .with_context(|| format!("host has no monitor {id}"))?,
-                None => info
-                    .monitors
-                    .iter()
-                    .find(|m| m.primary)
-                    .or(info.monitors.first())
-                    .context("host reports no monitors")?,
+            let source = if let Some(spec) = &window {
+                require_windows(&session)?;
+                SourceId::Window(find_window(&session.control(), spec).await?.id)
+            } else {
+                let target = match monitor {
+                    Some(id) => info
+                        .monitors
+                        .iter()
+                        .find(|m| m.id.0 == id)
+                        .with_context(|| format!("host has no monitor {id}"))?,
+                    None => info
+                        .monitors
+                        .iter()
+                        .find(|m| m.primary)
+                        .or(info.monitors.first())
+                        .context("host reports no monitors")?,
+                };
+                SourceId::Monitor(target.id)
             };
             let image = session
                 .control()
-                .screenshot(target.id, Codec::Png, max_width, Duration::from_secs(15))
+                .screenshot(source, Codec::Png, max_width, Duration::from_secs(15))
                 .await?;
             session.close("done");
             if output.as_os_str() == "-" {
@@ -313,7 +383,7 @@ async fn main() -> Result<()> {
                 if cli.json {
                     print_json(&serde_json::json!({
                         "path": output, "width": image.width, "height": image.height,
-                        "bytes": image.data.len(), "monitor": target.id.0,
+                        "bytes": image.data.len(), "source": source.to_string(),
                     }))?;
                 } else {
                     eprintln!(
@@ -615,6 +685,62 @@ pub(crate) fn peers_json(status: &Status, peers: &[&PeerStatus]) -> serde_json::
             })
             .collect(),
     )
+}
+
+/// Fails with a clear message when the host predates single-window capture.
+fn require_windows(session: &Session) -> Result<()> {
+    anyhow::ensure!(
+        session
+            .info()
+            .capabilities
+            .features
+            .contains(&peet_proto::Feature::WindowCapture),
+        "this host cannot capture single windows (needs Windows 10 1903 or later)"
+    );
+    Ok(())
+}
+
+/// Resolves a window ID (decimal or 0x hex) or a unique, case-insensitive title substring.
+async fn find_window(control: &peet_core::Control, spec: &str) -> Result<WindowInfo> {
+    pick_window(control.list_windows(Duration::from_secs(10)).await?, spec)
+}
+
+/// Picks a window from a host's list by ID or unique title substring (see [`find_window`]).
+pub(crate) fn pick_window(windows: Vec<WindowInfo>, spec: &str) -> Result<WindowInfo> {
+    let parsed = spec
+        .strip_prefix("0x")
+        .map_or_else(|| spec.parse::<u64>(), |hex| u64::from_str_radix(hex, 16));
+    if let Ok(id) = parsed {
+        return windows
+            .into_iter()
+            .find(|w| w.id.0 == id)
+            .with_context(|| format!("host has no window {spec} (see `peet windows`)"));
+    }
+    let needle = spec.to_lowercase();
+    let mut matches: Vec<WindowInfo> = windows
+        .into_iter()
+        .filter(|w| w.title.to_lowercase().contains(&needle))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => anyhow::bail!("no window title contains {spec:?} (see `peet windows`)"),
+        n => anyhow::bail!(
+            "{n} windows match {spec:?}; use an ID:\n{}",
+            matches
+                .iter()
+                .map(|w| format!("  {:#010x}  {}", w.id.0, w.title))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
+}
+
+pub(crate) fn window_json(w: &WindowInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": w.id.0, "title": w.title, "process": w.process,
+        "x": w.bounds.x, "y": w.bounds.y, "width": w.bounds.width, "height": w.bounds.height,
+        "minimized": w.minimized,
+    })
 }
 
 fn print_json(value: &serde_json::Value) -> Result<()> {

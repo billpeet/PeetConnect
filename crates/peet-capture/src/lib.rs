@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use peet_proto::{MonitorId, MonitorInfo, Rect};
+use peet_proto::{MonitorId, MonitorInfo, Rect, WindowId, WindowInfo};
 
 #[cfg(windows)]
 pub mod windows;
@@ -56,6 +56,18 @@ pub struct WindowDesc {
     pub bounds: Rect,
     /// Minimised windows are not rendered, so capture delivers no frames until restored.
     pub minimized: bool,
+}
+
+impl WindowDesc {
+    pub fn to_proto(&self) -> WindowInfo {
+        WindowInfo {
+            id: WindowId(self.id),
+            title: self.title.clone(),
+            process: self.process.clone(),
+            bounds: self.bounds,
+            minimized: self.minimized,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,7 +9,7 @@
 //! | Stream        | Direction        | Payload                                  |
 //! |---------------|------------------|------------------------------------------|
 //! | control       | bidirectional    | [`ClientHello`] / [`ServerHello`], then [`ControlMessage`] |
-//! | video[n]      | host to viewer   | [`VideoFrame`] per monitor                |
+//! | video[n]      | host to viewer   | [`VideoFrame`] per source (monitor or window) |
 //! | input         | viewer to host   | [`InputEvent`]                            |
 //! | clipboard     | bidirectional    | [`ClipboardMessage`]                      |
 //! | file          | bidirectional    | reserved                                  |
@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 pub mod frame;
 
 /// Protocol version spoken by this build. Bump on any incompatible change.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// v2: video streams, keyframe requests, stats and screenshots name a [`SourceId`] (monitor
+/// or window) instead of a monitor; window listing and window change messages.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Default UDP port the host listens on.
 pub const DEFAULT_PORT: u16 = 7735;
@@ -68,6 +71,39 @@ impl StreamKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MonitorId(pub u32);
 
+/// Identifies a top-level window on the host (the `HWND` value on Windows). Valid until the
+/// window closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WindowId(pub u64);
+
+/// What a video stream or screenshot shows: a whole monitor, or one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SourceId {
+    Monitor(MonitorId),
+    Window(WindowId),
+}
+
+impl From<MonitorId> for SourceId {
+    fn from(id: MonitorId) -> Self {
+        Self::Monitor(id)
+    }
+}
+
+impl From<WindowId> for SourceId {
+    fn from(id: WindowId) -> Self {
+        Self::Window(id)
+    }
+}
+
+impl std::fmt::Display for SourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Monitor(m) => write!(f, "monitor {}", m.0),
+            Self::Window(w) => write!(f, "window {:#x}", w.0),
+        }
+    }
+}
+
 /// Identifies a session on the host; useful for logs and for the local control API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub u64);
@@ -95,6 +131,8 @@ pub enum Feature {
     Screenshot,
     /// Host accepts more than one simultaneous viewer.
     MultiViewer,
+    /// Host can list, stream, screenshot and focus single windows.
+    WindowCapture,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +160,30 @@ pub struct MonitorInfo {
     /// DPI scale as a percentage (100, 125, 150, ...).
     pub scale_percent: u16,
     pub primary: bool,
+}
+
+/// A top-level window the host can stream on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub id: WindowId,
+    pub title: String,
+    /// Executable name of the owning process, e.g. `Code.exe`; empty if unknown.
+    pub process: String,
+    /// Visible bounds in host virtual desktop coordinates (no invisible resize borders).
+    pub bounds: Rect,
+    /// Minimised windows produce no video until restored.
+    pub minimized: bool,
+}
+
+/// How a streamed window changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowChange {
+    /// Moved or resized; new visible bounds in host desktop coordinates.
+    Bounds(Rect),
+    Minimized,
+    Restored,
+    /// The window is gone and its stream has ended.
+    Closed,
 }
 
 /// First message on the control stream, viewer to host.
@@ -172,16 +234,16 @@ pub enum ControlMessage {
     Pong {
         nonce: u64,
     },
-    /// Viewer asks the host to (re)start a monitor's video stream with the given limits.
+    /// Viewer asks the host to (re)start a source's video stream with the given limits.
     SetStream {
-        monitor: MonitorId,
+        source: SourceId,
         enabled: bool,
         max_fps: Option<u16>,
         max_bitrate_kbps: Option<u32>,
     },
     /// Viewer asks for an IDR frame, typically after loss.
     RequestKeyframe {
-        monitor: MonitorId,
+        source: SourceId,
     },
     /// Host reports a new monitor layout (resolution, DPI or topology change).
     MonitorsChanged {
@@ -208,9 +270,28 @@ pub enum ControlMessage {
     Disconnect {
         reason: String,
     },
-    /// Host-side stream statistics, sent about once a second per active monitor.
+    /// Viewer asks for the host's capturable windows.
+    ListWindows {
+        request_id: u64,
+    },
+    /// Host's reply to [`ControlMessage::ListWindows`], front to back.
+    Windows {
+        request_id: u64,
+        windows: Vec<WindowInfo>,
+    },
+    /// Host reports a change to a window the viewer is streaming.
+    WindowChanged {
+        window: WindowId,
+        change: WindowChange,
+    },
+    /// Viewer asks the host to restore (if minimised) and bring a window to the front, so
+    /// injected input reaches it. Input goes to whatever is on top at the pointer.
+    FocusWindow {
+        window: WindowId,
+    },
+    /// Host-side stream statistics, sent about once a second per active stream.
     StreamStats {
-        monitor: MonitorId,
+        source: SourceId,
         fps: u16,
         bitrate_kbps: u32,
         /// Captured frames the host skipped because the network was not keeping up.
@@ -239,12 +320,12 @@ pub struct CursorShape {
     pub bgra: Vec<u8>,
 }
 
-/// Request a still of one monitor. Serviced independently of the video stream so a
+/// Request a still of one monitor or window. Serviced independently of the video stream so a
 /// headless agent never needs a video decoder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenshotRequest {
     pub request_id: u64,
-    pub monitor: MonitorId,
+    pub source: SourceId,
     pub codec: Codec,
     /// Optional downscale; `None` means native resolution.
     pub max_width: Option<u32>,
@@ -264,11 +345,12 @@ pub struct EncodedImage {
     pub data: Vec<u8>,
 }
 
-/// One encoded video frame on a monitor's video stream.
+/// One encoded video frame on a source's video stream. A window stream's frame size changes
+/// when the window is resized; the frame after a size change is a keyframe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoFrame {
-    pub monitor: MonitorId,
-    /// Monotonic per-monitor sequence number; gaps mean loss.
+    pub source: SourceId,
+    /// Monotonic per-stream sequence number; gaps mean loss.
     pub seq: u64,
     /// Host capture timestamp in microseconds since session start.
     pub pts_us: u64,
@@ -348,7 +430,7 @@ mod tests {
     #[test]
     fn video_frame_round_trips() {
         let frame = VideoFrame {
-            monitor: MonitorId(1),
+            source: SourceId::Window(WindowId(0x1234)),
             seq: 7,
             pts_us: 16_666,
             keyframe: true,

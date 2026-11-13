@@ -417,6 +417,34 @@ WGC is tested from SYSTEM and across a secure-desktop switch. Verified by forcin
 Desktop Duplication now delivers frames on the dev box (the M1 open issue no longer reproduces,
 39 fps on DISPLAY2), so `Auto` stays on DXGI there.
 
+*Work items 2–4 (2026-11-13)* — Protocol v2 (`PROTOCOL_VERSION` 2; hellos unchanged, so a v1
+peer gets a clean `UnsupportedProtocolVersion`): `SourceId::{Monitor, Window}` in `VideoFrame`,
+`SetStream`, `RequestKeyframe`, `StreamStats`, `ScreenshotRequest`; `WindowInfo`,
+`ListWindows`/`Windows`, `WindowChanged { Bounds | Minimized | Restored | Closed }`,
+`FocusWindow`, `Feature::WindowCapture` (advertised when WGC is available). Host: `VideoStream`
+over a monitor `FrameSource` or a window `WgcCapturer`; the window thread polls position and
+state every 100 ms and reports changes, rebuilds capture and encoder 300 ms after a resize
+settles (new keyframe at the new even size), and ends the stream with `Closed`. Cursor updates
+are offset by the window's position. `FocusWindow` restores and foregrounds the window, tapping
+Alt to get past the foreground lock when needed. Window screenshots go through WGC.
+`GraphicsCaptureItem.Closed` did not fire when the test window closed, so `WgcCapturer` also
+checks `IsWindow` whenever an acquire times out. Client: `peet-core` `list_windows`,
+`focus_window`, and `set_stream`/`request_keyframe`/`screenshot` take `impl Into<SourceId>`;
+CLI `peet windows`, `peet focus <window>`, `peet screenshot --window <id|title>`; MCP
+`peet_windows`, `peet_focus_window`, `peet_screenshot { window }`. The viewer speaks v2 but still
+streams monitors only (item 5). `peet-bench testwindow` (hidden) opens a titled window that
+moves, resizes, minimises, restores and closes itself on a schedule.
+
+Verified against a loopback test host with a throwaway client probe: the test window listed,
+screenshotted (782x590, frame and title bar included, no border), streamed at ~26 fps; move
+reported as `Bounds`; resize to 1001x701 produced `Bounds`, then frames at 982x692 starting with a
+keyframe; `Minimized` (frames stop) and `Restored` (frames resume); `Closed` within ~100 ms of
+the window closing. CLI: `peet windows` listed it; `peet screenshot --window` under a grey cover
+from another process returned the window's own content; `peet focus` on the minimised window
+restored it and took the foreground from another app. MCP: tools listed, `peet_windows` returned
+16 windows, `peet_screenshot { window: "Task Manager" }` returned a PNG. Compatibility: v0.2.0
+viewers and hosts cannot talk to this build; ship host and viewer together.
+
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.
 

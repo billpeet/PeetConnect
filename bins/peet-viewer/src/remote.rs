@@ -18,7 +18,8 @@ use peet_capture::windows::D3dDevice;
 use peet_codec::windows::MfH264Decoder;
 use peet_core::{ConnectOptions, Control, Event};
 use peet_proto::{
-    ControlMessage, CursorShape, InputEvent, MonitorId, MonitorInfo, RejectReason, VideoFrame,
+    ControlMessage, CursorShape, InputEvent, MonitorId, MonitorInfo, RejectReason, SourceId,
+    VideoFrame,
 };
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
@@ -139,14 +140,14 @@ impl RemoteShared {
         };
         for previous in disable {
             control.try_send(ControlMessage::SetStream {
-                monitor: previous,
+                source: SourceId::Monitor(previous),
                 enabled: false,
                 max_fps: None,
                 max_bitrate_kbps: None,
             });
         }
         control.try_send(ControlMessage::SetStream {
-            monitor,
+            source: SourceId::Monitor(monitor),
             enabled: true,
             max_fps: None,
             max_bitrate_kbps: None,
@@ -167,7 +168,7 @@ impl RemoteShared {
         };
         for monitor in monitors {
             control.try_send(ControlMessage::SetStream {
-                monitor,
+                source: SourceId::Monitor(monitor),
                 enabled: true,
                 max_fps: None,
                 max_bitrate_kbps: None,
@@ -374,14 +375,15 @@ async fn session(
                     Event::MonitorsChanged(monitors) => {
                         shared.status.lock().expect("status poisoned").monitors = monitors;
                     }
-                    Event::StreamStats { monitor, fps, bitrate_kbps, skipped } => {
+                    Event::StreamStats { source, fps, bitrate_kbps, skipped } => {
                         let mut status = shared.status.lock().expect("status poisoned");
-                        if status.current == Some(monitor) {
+                        if status.current.map(SourceId::Monitor) == Some(source) {
                             status.host_fps = fps;
                             status.kbps = bitrate_kbps;
                             status.skipped = skipped;
                         }
                     }
+                    Event::WindowChanged { .. } => {}
                     Event::Clipboard(text) => {
                         tracing::info!(chars = text.chars().count(), "clipboard received from host");
                         *shared.clipboard_in.lock().expect("clipboard poisoned") = Some(text);
@@ -491,6 +493,10 @@ fn decode_loop(
     let mut generation = shared.generation.load(Ordering::Relaxed);
 
     while let Some(frame) = frames.blocking_recv() {
+        // The viewer streams monitors only so far; window streams arrive in M8 item 5.
+        let SourceId::Monitor(frame_monitor) = frame.source else {
+            continue;
+        };
         let (visible, current) = {
             let status = shared.status.lock().expect("status poisoned");
             let visible: Vec<MonitorInfo> = if status.all_monitors {
@@ -505,9 +511,9 @@ fn decode_loop(
             };
             (visible, status.current)
         };
-        if !visible.iter().any(|m| m.id == frame.monitor) {
+        if !visible.iter().any(|m| m.id == frame_monitor) {
             // Tail of a stream we switched away from.
-            decoders.remove(&frame.monitor);
+            decoders.remove(&frame_monitor);
             continue;
         }
         // A reconnect restarts sequence numbers and may change the streams, so start clean.
@@ -519,21 +525,21 @@ fn decode_loop(
         let size = (frame.width, frame.height);
         // Compare against the size we created the decoder with, not the decoder's own
         // report: it switches to the coded size (1088 rows for 1080p) after the first frame.
-        if decoders.get(&frame.monitor).is_some_and(|d| d.size != size) {
-            decoders.remove(&frame.monitor);
+        if decoders.get(&frame_monitor).is_some_and(|d| d.size != size) {
+            decoders.remove(&frame_monitor);
         }
-        if let std::collections::hash_map::Entry::Vacant(slot) = decoders.entry(frame.monitor) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = decoders.entry(frame_monitor) {
             slot.insert(Dec {
                 decoder: MfH264Decoder::new(size.0, size.1, &device.device)?,
                 size,
                 last_seq: frame.seq.saturating_sub(1),
                 waiting_for_keyframe: true,
             });
-            if current == Some(frame.monitor) || visible.len() == 1 {
+            if current == Some(frame_monitor) || visible.len() == 1 {
                 shared.status.lock().expect("status poisoned").frame_size = size;
             }
         }
-        let dec = decoders.get_mut(&frame.monitor).expect("decoder ensured");
+        let dec = decoders.get_mut(&frame_monitor).expect("decoder ensured");
         let lost = frame.seq != dec.last_seq + 1 && frame.seq > dec.last_seq;
         dec.last_seq = frame.seq;
         if lost && !frame.keyframe {
@@ -544,9 +550,9 @@ fn decode_loop(
                 dec.waiting_for_keyframe = false;
             } else {
                 let since = last_keyframe_request
-                    .entry(frame.monitor)
+                    .entry(frame_monitor)
                     .or_insert_with(long_ago);
-                request_keyframe(shared, frame.monitor, since);
+                request_keyframe(shared, frame_monitor, since);
                 continue;
             }
         }
@@ -555,17 +561,17 @@ fn decode_loop(
             Ok(pictures) => pictures,
             Err(err) => {
                 tracing::warn!(%err, seq = frame.seq, "decode failed; waiting for a keyframe");
-                decoders.remove(&frame.monitor);
+                decoders.remove(&frame_monitor);
                 let since = last_keyframe_request
-                    .entry(frame.monitor)
+                    .entry(frame_monitor)
                     .or_insert_with(long_ago);
-                request_keyframe(shared, frame.monitor, since);
+                request_keyframe(shared, frame_monitor, since);
                 continue;
             }
         };
         decode_time += t0.elapsed();
         for picture in &pictures {
-            presenter.present(frame.monitor, picture, &visible)?;
+            presenter.present(frame_monitor, picture, &visible)?;
             frames_in_period += 1;
         }
         if period.elapsed() >= Duration::from_secs(1) {
@@ -591,6 +597,8 @@ fn request_keyframe(shared: &RemoteShared, monitor: MonitorId, last: &mut Instan
     }
     *last = Instant::now();
     if let Some(control) = shared.control.lock().expect("control poisoned").as_ref() {
-        control.try_send(ControlMessage::RequestKeyframe { monitor });
+        control.try_send(ControlMessage::RequestKeyframe {
+            source: SourceId::Monitor(monitor),
+        });
     }
 }

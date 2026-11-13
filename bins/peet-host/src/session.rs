@@ -6,11 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use peet_capture::windows::{enumerate_monitors, Backend};
-use peet_capture::MonitorDesc;
+use peet_capture::windows::{
+    describe_window, enumerate_monitors, enumerate_windows, wgc_supported, Backend,
+};
+use peet_capture::{MonitorDesc, WindowDesc};
 use peet_proto::{
-    Capabilities, ClientHello, Codec, ControlMessage, Feature, InputEvent, MonitorId, RejectReason,
-    ScreenshotResult, ServerHello, SessionId, StreamKind, PROTOCOL_VERSION,
+    Capabilities, ClientHello, Codec, ControlMessage, Feature, InputEvent, RejectReason,
+    ScreenshotResult, ServerHello, SessionId, SourceId, StreamKind, WindowChange, PROTOCOL_VERSION,
 };
 use peet_transport::{quinn, FramedRecv, FramedSend, TransportError};
 use tokio::sync::mpsc;
@@ -18,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::auth::Authoriser;
 use crate::config::HostConfig;
 use crate::control::ControlHub;
-use crate::stream::{MonitorStream, StreamParams};
+use crate::stream::{Source, StreamParams, VideoStream};
 
 /// Shared across sessions.
 #[derive(Debug)]
@@ -133,7 +135,13 @@ async fn handshake(state: &HostState, connection: &quinn::Connection) -> Result<
         codec: Codec::H264,
         capabilities: Capabilities {
             codecs: vec![Codec::H264],
-            features: vec![Feature::Screenshot, Feature::Clipboard],
+            features: {
+                let mut features = vec![Feature::Screenshot, Feature::Clipboard];
+                if wgc_supported() {
+                    features.push(Feature::WindowCapture);
+                }
+                features
+            },
         },
         monitors: monitors.iter().map(MonitorDesc::to_proto).collect(),
     })
@@ -171,7 +179,7 @@ async fn control_loop(
     kick: &tokio::sync::Notify,
 ) -> Result<&'static str> {
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMessage>(256);
-    let mut streams: HashMap<MonitorId, MonitorStream> = HashMap::new();
+    let mut streams: HashMap<SourceId, VideoStream> = HashMap::new();
     let session_start = Instant::now();
     tokio::spawn(accept_input_streams(
         connection.clone(),
@@ -204,16 +212,31 @@ async fn control_loop(
                         send.send(&ControlMessage::Pong { nonce }).await?;
                     }
                     ControlMessage::Pong { .. } => {}
-                    ControlMessage::SetStream { monitor, enabled, max_fps, max_bitrate_kbps } => {
+                    ControlMessage::SetStream { source, enabled, max_fps, max_bitrate_kbps } => {
+                        // Window streams end on their own when the window closes.
+                        streams.retain(|_, s| !s.finished());
                         if !enabled {
-                            if streams.remove(&monitor).is_some() {
-                                tracing::info!(session = session_id.0, monitor = monitor.0, "stream disabled");
+                            if streams.remove(&source).is_some() {
+                                tracing::info!(session = session_id.0, %source, "stream disabled");
                             }
                             continue;
                         }
-                        let Some(desc) = monitors.iter().find(|m| m.id == monitor) else {
-                            tracing::warn!(session = session_id.0, monitor = monitor.0, "unknown monitor requested");
-                            continue;
+                        let stream_source = match source {
+                            SourceId::Monitor(monitor) => {
+                                let Some(desc) = monitors.iter().find(|m| m.id == monitor) else {
+                                    tracing::warn!(session = session_id.0, %source, "unknown monitor requested");
+                                    continue;
+                                };
+                                Source::Monitor(desc.clone())
+                            }
+                            SourceId::Window(window) => {
+                                if describe_window(window.0).is_none() {
+                                    tracing::warn!(session = session_id.0, %source, "unknown window requested");
+                                    send.send(&ControlMessage::WindowChanged { window, change: WindowChange::Closed }).await?;
+                                    continue;
+                                }
+                                Source::Window(window)
+                            }
                         };
                         let params = StreamParams {
                             fps: max_fps.map_or(state.config.fps, |f| u32::from(f).min(state.config.fps)).max(1),
@@ -221,28 +244,56 @@ async fn control_loop(
                             backend: parse_backend(&state.config.capture),
                             follow_desktop: state.config.follow_desktop,
                         };
-                        if streams.get(&monitor).is_some_and(|s| s.params.fps == params.fps && s.params.bitrate_kbps == params.bitrate_kbps) {
-                            streams[&monitor].request_keyframe();
+                        if streams.get(&source).is_some_and(|s| s.params.fps == params.fps && s.params.bitrate_kbps == params.bitrate_kbps) {
+                            streams[&source].request_keyframe();
                             continue;
                         }
                         // Replace any existing stream (drop stops it first).
-                        streams.remove(&monitor);
-                        streams.insert(monitor, MonitorStream::start(
-                            connection.clone(), desc.clone(), params, ctl_tx.clone(), session_start,
+                        streams.remove(&source);
+                        streams.insert(source, VideoStream::start(
+                            connection.clone(), stream_source, params, ctl_tx.clone(), session_start,
                         ));
                     }
-                    ControlMessage::RequestKeyframe { monitor } => {
-                        if let Some(stream) = streams.get(&monitor) {
+                    ControlMessage::RequestKeyframe { source } => {
+                        if let Some(stream) = streams.get(&source) {
                             stream.request_keyframe();
                         }
                     }
-                    ControlMessage::Screenshot(request) => {
-                        let desc = monitors.iter().find(|m| m.id == request.monitor).cloned();
+                    ControlMessage::ListWindows { request_id } => {
                         let tx = ctl_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let result = match desc {
-                                Some(desc) => crate::screenshot::capture(&desc, request.codec, request.max_width),
-                                None => Err(format!("monitor {} not found", request.monitor.0)),
+                            let windows = enumerate_windows()
+                                .unwrap_or_else(|err| {
+                                    tracing::warn!(%err, "listing windows failed");
+                                    Vec::new()
+                                })
+                                .iter()
+                                .map(WindowDesc::to_proto)
+                                .collect();
+                            let _ = tx.blocking_send(ControlMessage::Windows { request_id, windows });
+                        });
+                    }
+                    ControlMessage::FocusWindow { window } => {
+                        let follow_desktop = state.config.follow_desktop;
+                        tokio::task::spawn_blocking(move || {
+                            let _desktop = follow_desktop.then(crate::desktop::attach_input_desktop).flatten();
+                            if let Err(err) = crate::window::focus(window.0) {
+                                tracing::info!(window = window.0, %err, "focus failed");
+                            }
+                        });
+                    }
+                    ControlMessage::Screenshot(request) => {
+                        let monitor = match request.source {
+                            SourceId::Monitor(id) => monitors.iter().find(|m| m.id == id).cloned(),
+                            SourceId::Window(_) => None,
+                        };
+                        let adapter = monitors.first().map_or(0, |m| m.adapter_index);
+                        let tx = ctl_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = match (request.source, monitor) {
+                                (SourceId::Window(w), _) => crate::screenshot::capture_window(w.0, adapter, request.codec, request.max_width),
+                                (_, Some(desc)) => crate::screenshot::capture(&desc, request.codec, request.max_width),
+                                (source, None) => Err(format!("{source} not found")),
                             };
                             let _ = tx.blocking_send(ControlMessage::ScreenshotResult(ScreenshotResult {
                                 request_id: request.request_id,
@@ -277,6 +328,8 @@ async fn control_loop(
                     | ControlMessage::MonitorsChanged { .. }
                     | ControlMessage::ScreenshotResult(_)
                     | ControlMessage::ClipboardText { .. }
+                    | ControlMessage::Windows { .. }
+                    | ControlMessage::WindowChanged { .. }
                     | ControlMessage::StreamStats { .. } => {
                         tracing::debug!(session = session_id.0, ?msg, "ignoring host-only message from viewer");
                     }
