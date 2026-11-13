@@ -136,7 +136,11 @@ impl GdiCapturer {
                 height: self.height,
             }],
             moved: Vec::new(),
-            cursor: cursor_state(&self.monitor, &mut self.cursor),
+            cursor: cursor_state(
+                self.monitor.bounds.x,
+                self.monitor.bounds.y,
+                &mut self.cursor,
+            ),
         })
     }
 
@@ -190,8 +194,13 @@ impl Drop for GdiCapturer {
 /// `CURSOR_SHOWING` from WinUser.h.
 const CURSOR_SHOWING: CURSORINFO_FLAGS = CURSORINFO_FLAGS(1);
 
-/// Current cursor position relative to `monitor`, plus the shape when it changed.
-fn cursor_state(monitor: &MonitorDesc, tracker: &mut CursorTracker) -> Option<CursorState> {
+/// Current cursor position relative to the desktop point (`origin_x`, `origin_y`), plus the
+/// shape when it changed.
+pub(crate) fn cursor_state(
+    origin_x: i32,
+    origin_y: i32,
+    tracker: &mut CursorTracker,
+) -> Option<CursorState> {
     let mut info = CURSORINFO {
         cbSize: u32::try_from(std::mem::size_of::<CURSORINFO>()).unwrap_or(0),
         ..Default::default()
@@ -199,8 +208,8 @@ fn cursor_state(monitor: &MonitorDesc, tracker: &mut CursorTracker) -> Option<Cu
     // SAFETY: cbSize is set as required.
     unsafe { GetCursorInfo(&mut info) }.ok()?;
     Some(CursorState {
-        x: info.ptScreenPos.x - monitor.bounds.x,
-        y: info.ptScreenPos.y - monitor.bounds.y,
+        x: info.ptScreenPos.x - origin_x,
+        y: info.ptScreenPos.y - origin_y,
         visible: info.flags.0 & CURSOR_SHOWING.0 != 0,
         shape: tracker.shape_if_changed(info.hCursor),
     })

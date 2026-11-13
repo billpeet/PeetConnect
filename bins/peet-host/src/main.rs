@@ -54,7 +54,7 @@ pub struct Cli {
     /// Bitrate cap in kbit/s; viewers may ask for less.
     #[arg(long)]
     bitrate_kbps: Option<u32>,
-    /// Capture backend: auto, dxgi or gdi.
+    /// Capture backend: auto, dxgi, wgc or gdi.
     #[arg(long)]
     capture: Option<String>,
     /// Run in the foreground attached to this console.

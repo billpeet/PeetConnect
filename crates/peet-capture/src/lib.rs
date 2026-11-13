@@ -43,6 +43,21 @@ impl MonitorDesc {
     }
 }
 
+/// A top-level window that can be captured on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowDesc {
+    /// Backend-specific handle; on Windows the `HWND` value. Valid until the window closes.
+    pub id: u64,
+    pub title: String,
+    /// Executable file name of the owning process, e.g. `T3 Code.exe`. Empty if unknown.
+    pub process: String,
+    pub pid: u32,
+    /// Visible bounds in virtual desktop coordinates, without invisible resize borders.
+    pub bounds: Rect,
+    /// Minimised windows are not rendered, so capture delivers no frames until restored.
+    pub minimized: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
     Identity,
@@ -203,6 +218,9 @@ pub enum CaptureError {
     Unsupported(String),
     #[error("monitor {0:?} not found")]
     MonitorNotFound(MonitorId),
+    /// The captured window closed. The capturer cannot recover.
+    #[error("the captured window was closed")]
+    Closed,
     #[error("os error {code:#010x}: {message}")]
     Os { code: i32, message: String },
 }

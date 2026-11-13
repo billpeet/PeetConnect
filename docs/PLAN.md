@@ -335,6 +335,81 @@ with the installer, zip, `latest.json(.sig)` and `SHA256SUMS`; the installer's h
 matched the manifest. Decided the same day: openh264 stays out of release builds (see "Known hard
 parts").
 
+**M8 — Single-window streaming.** (planned) Stream one host window instead of a whole monitor,
+so a remote app (an editor, T3 Code) can be watched and driven as if it ran locally. Researched
+2026-11-13.
+
+*Capture choice.* Windows.Graphics.Capture (WGC) created from an `HWND`
+(`IGraphicsCaptureItemInterop::CreateForWindow`). It reads the window's DWM surface, so a window
+keeps updating while other windows cover it, and frames arrive as D3D11 textures on our device,
+so the zero-copy NV12 encode path is unchanged. Rejected: DXGI cropped to the window rectangle
+(shows whatever covers the window, and delivers nothing on the dev box), `PrintWindow` (CPU,
+slow; kept in mind for one-off screenshots), GDI `BitBlt` from the window DC (no DWM content).
+WGC monitor capture (`CreateForMonitor`) is the same code, and is the third backend M1 asked
+for, so it comes first.
+
+*Limits, accepted.* Minimised windows are not rendered by DWM: no frames until restored (offer
+a restore, or show the last frame marked "minimised"). Menus, tooltips and dropdowns are separate
+top-level windows; `GraphicsCaptureSession.IncludeSecondaryWindows` (Windows 11 24H2+) pulls in
+the window's popups, older builds miss them. Windows excluded from capture
+(`WDA_EXCLUDEFROMCAPTURE`) come out black. Cloaked windows (other virtual desktops) are listed as
+unavailable. Input still goes through `SendInput` in desktop coordinates, so the window must be
+in front to receive it: watching works when covered, and the first input to a window stream
+brings it to the foreground. Posting input messages straight to the `HWND` is rejected (Chromium
+and Electron ignore much of it). Whether WGC works from the SYSTEM service worker is unknown;
+the `--console` host is the tested path.
+
+*Work items.*
+1. WGC spike in `peet-capture` and `peet-bench`: `Backend::Wgc` for monitors, window
+   enumeration, window capture into a fixed-size texture, and bench measurements (capture time,
+   frame cadence, covered and minimised windows, border, secondary windows). Decide whether
+   `Auto` becomes DXGI → WGC → GDI.
+2. Protocol v2: a stream source (monitor or window) replaces `MonitorId` in `VideoFrame`,
+   `SetStream`, `RequestKeyframe`, `StreamStats` and `ScreenshotRequest`; `ListWindows` /
+   `Windows`; `WindowChanged` (moved or resized, minimised, closed); `Feature::WindowCapture`.
+3. Host: streams keyed by source; on resize, debounce then restart the encoder at the new even
+   size with a keyframe; end the stream when the window closes; bring the window forward on
+   first input; window bounds from `DWMWA_EXTENDED_FRAME_BOUNDS` (the window rectangle includes
+   invisible resize borders).
+4. CLI and MCP: `peet windows`, `peet screenshot --window <title>`.
+5. Viewer: window picker beside the monitor picker; a window is one tile in `present.rs`.
+6. Later polish: size the viewer to the remote window at 1:1, mirror its title, resize the
+   remote window when the viewer is resized.
+
+*Work item 1 (2026-11-13)* — `peet-capture`: `WgcCapturer` (free-threaded frame pool,
+`FrameArrived` wakes `acquire`, newest frame copied into a fixed even-sized BGRA texture, pool
+recreated on resize with `content_size()` reporting the real size, `CaptureError::Closed` when the
+window goes), `Backend::Wgc` in `FrameSource` (host accepts `capture = "wgc"`), and
+`enumerate_windows` / `describe_window` (`WindowDesc`). `peet-bench`: `--capture wgc`, `windows`,
+and `window [--target] [--occlude] [--minimize]`, which captures the bench's own animated window
+(or a named one) through clear / covered / minimised phases; the cover is a grey topmost window
+owned by a child process, and the bench samples the centre pixel to see whether it leaked in.
+Measured on DESKTOP-ER4U7GP (RTX 4060 Ti, build 26300, NVENC, release build):
+
+| Capture | 1080p monitor | 4K monitor |
+|---|---|---|
+| WGC | 39 fps (limited by the stimulus repaint rate; same at a 240 fps cap), 9.5% of a core | 50 fps, 10.8% of a core |
+| GDI | 59.5 fps (copies every slot, changed or not), 32% of a core | 18.7 fps, 41% of a core |
+
+Findings: (1) Covered windows capture normally: cover from another process visible in 0/110
+frames, frame rate unchanged. (2) `IncludeSecondaryWindows` composites in *any* top-level window
+of the same process that overlaps, not only popups: a same-process cover was visible in 114/114
+frames with it on, 0/117 off. For a multi-window app that means its other windows can appear in
+the stream; keep it on for menus, but expose it. (3) Minimised: no frames at all. (4) Borderless
+access is granted to the unpackaged bench without a prompt; decoded frames have no yellow border.
+`IncludeSecondaryWindows` and `MinUpdateInterval` are both accepted on this build. (5) The capture
+content size equals `DWMWA_EXTENDED_FRAME_BOUNDS` exactly; `GetWindowRect` is larger by the
+invisible borders (22 px on a maximised T3 Code window). (6) An idle window delivers one frame at
+start, then nothing until it changes. The host only applies a keyframe request when a new frame
+arrives, so a viewer that joins or loses packets on a still window (or a still desktop under DXGI,
+the same latent bug) waits for the next change; the stream thread must re-encode the last texture
+on a keyframe request, and a slow refresh would help too. All `.h264` outputs decode with ffprobe
+at the expected frame counts.
+
+Not yet decided: making `Auto` DXGI → WGC → GDI. The numbers favour it (on the dev box `Auto`
+lands on GDI today), but fix the keyframe-on-still-frame issue first, and WGC from the SYSTEM
+service worker is still untested.
+
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.
 

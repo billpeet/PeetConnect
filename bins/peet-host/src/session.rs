@@ -409,6 +409,7 @@ pub fn parse_backend(name: &str) -> Backend {
     match name {
         "dxgi" => Backend::Dxgi,
         "gdi" => Backend::Gdi,
+        "wgc" => Backend::Wgc,
         _ => Backend::Auto,
     }
 }

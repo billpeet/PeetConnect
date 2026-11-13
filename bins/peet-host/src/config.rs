@@ -17,7 +17,7 @@
 //! [video]
 //! fps = 60
 //! max_bitrate_kbps = 12000
-//! capture = "auto"   # auto | dxgi | gdi
+//! capture = "auto"   # auto | dxgi | wgc | gdi
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -74,7 +74,7 @@ pub struct VideoConfig {
     pub fps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bitrate_kbps: Option<u32>,
-    /// `auto`, `dxgi` or `gdi`.
+    /// `auto`, `dxgi`, `wgc` or `gdi`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<String>,
 }
@@ -125,7 +125,7 @@ const TEMPLATE_HEADER: &str = "\
 # [video]
 # fps = 60
 # max_bitrate_kbps = 12000
-# capture = \"auto\"        # auto | dxgi | gdi
+# capture = \"auto\"        # auto | dxgi | wgc | gdi
 ";
 
 /// The default file: per-user for a console host, machine-wide for the service and its worker.

@@ -1,6 +1,6 @@
 //! A frame source that picks a backend and keeps the latest frame in a GPU texture.
 //!
-//! Wraps [`DxgiCapturer`] and [`GdiCapturer`] behind one interface, with a watchdog: in
+//! Wraps [`DxgiCapturer`], [`WgcCapturer`] and [`GdiCapturer`] behind one interface, with a watchdog: in
 //! `Auto` mode, if Desktop Duplication produces no desktop frame within a grace period the
 //! source switches to GDI. Desktop Duplication can fail silently in exactly this way.
 
@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
-use super::{D3dDevice, DxgiCapturer, GdiCapturer};
+use super::{D3dDevice, DxgiCapturer, GdiCapturer, WgcCapturer, WgcOptions, WgcTarget};
 use crate::{CaptureError, CpuFrame, FrameMeta, MonitorDesc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -21,6 +21,8 @@ pub enum Backend {
     #[default]
     Auto,
     Dxgi,
+    /// Windows.Graphics.Capture of the whole monitor.
+    Wgc,
     Gdi,
 }
 
@@ -29,6 +31,7 @@ pub const DXGI_GRACE: Duration = Duration::from_millis(1500);
 
 enum Inner {
     Dxgi(DxgiCapturer),
+    Wgc(WgcCapturer),
     Gdi {
         cap: GdiCapturer,
         texture: ID3D11Texture2D,
@@ -67,6 +70,14 @@ impl FrameSource {
     ) -> Result<Self, CaptureError> {
         let inner = match backend {
             Backend::Gdi => gdi(&device, monitor, fps)?,
+            Backend::Wgc => Inner::Wgc(WgcCapturer::new(
+                device.clone(),
+                WgcTarget::Monitor(monitor.clone()),
+                WgcOptions {
+                    min_interval: Some(Duration::from_secs(1) / fps.max(1)),
+                    ..WgcOptions::default()
+                },
+            )?),
             Backend::Dxgi | Backend::Auto => {
                 Inner::Dxgi(DxgiCapturer::new(device.clone(), monitor)?)
             }
@@ -86,6 +97,7 @@ impl FrameSource {
     pub fn name(&self) -> &'static str {
         match self.inner {
             Inner::Dxgi(_) => "dxgi",
+            Inner::Wgc(_) => "wgc",
             Inner::Gdi { .. } => "gdi",
         }
     }
@@ -102,6 +114,7 @@ impl FrameSource {
     pub fn size(&self) -> (u32, u32) {
         match &self.inner {
             Inner::Dxgi(c) => c.size(),
+            Inner::Wgc(c) => c.size(),
             Inner::Gdi { cap, .. } => cap.size(),
         }
     }
@@ -138,6 +151,7 @@ impl FrameSource {
         }
         let result = match &mut self.inner {
             Inner::Dxgi(c) => c.acquire(timeout),
+            Inner::Wgc(c) => c.acquire(timeout),
             Inner::Gdi { cap, texture, .. } => {
                 let meta = cap.capture()?;
                 cap.upload(&self.device, texture);
@@ -159,6 +173,7 @@ impl FrameSource {
     pub fn texture(&self) -> &ID3D11Texture2D {
         match &self.inner {
             Inner::Dxgi(c) => c.texture(),
+            Inner::Wgc(c) => c.texture(),
             Inner::Gdi { texture, .. } => texture,
         }
     }
@@ -166,6 +181,7 @@ impl FrameSource {
     pub fn read_cpu(&mut self, out: &mut CpuFrame) -> Result<(), CaptureError> {
         match &mut self.inner {
             Inner::Dxgi(c) => c.read_cpu(out),
+            Inner::Wgc(c) => c.read_cpu(out),
             Inner::Gdi { cap, .. } => {
                 cap.read_cpu(out);
                 Ok(())
