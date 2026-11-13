@@ -56,6 +56,10 @@ pub struct HostStatus {
     pub pin_required: bool,
     /// The configuration file the host reads (it may not exist yet).
     pub config_path: Option<String>,
+    /// The host's own log file, when it writes one (the service worker). A console host's
+    /// output goes wherever its parent sent it.
+    #[serde(default)]
+    pub log_path: Option<String>,
     pub sessions: Vec<SessionInfo>,
 }
 
@@ -271,6 +275,7 @@ mod tests {
             admits_anyone: true,
             pin_required: false,
             config_path: None,
+            log_path: None,
             sessions: vec![SessionInfo {
                 id: 1,
                 node: "laptop".into(),

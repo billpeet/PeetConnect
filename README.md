@@ -163,8 +163,11 @@ scripts\install-service.ps1 -AllowUser you@example.com      # installs and start
 scripts\install-service.ps1 -Uninstall                      # stops and removes
 ```
 
-The allow rules are baked into the service command line; reinstall to change them. Under the
-hood the script runs `peet-host --install <flags>` elevated and `sc start PeetConnect`.
+The service reads `%ProgramData%\PeetConnect\host.toml` (Administrators only) and logs to
+`%ProgramData%\PeetConnect\logs`. Installing writes the allow rules you pass into that file if it
+does not exist yet; afterwards edit it (tray: Open configuration, which asks for admin) and restart
+the service (tray: Restart service). Under the hood the script runs `peet-host --install <flags>`
+elevated and `sc start PeetConnect`.
 
 The service path is implemented but unverified: the development machine has no administrator
 rights to install a service, and the secure-desktop and session-switch behaviour needs a locked

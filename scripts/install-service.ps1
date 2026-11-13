@@ -7,8 +7,9 @@
   capture the screen and inject input, including across the secure desktop. Installing a service
   needs administrator rights; this script relaunches itself elevated if necessary.
 
-  The allow rules you pass here are baked into the service's command line, so the service always
-  starts with them. Change them by reinstalling.
+  The settings you pass here are written to %ProgramData%\PeetConnect\host.toml when that file
+  does not exist yet. After that, edit the file (as administrator) and restart the service;
+  passing settings again while the file exists is an error.
 
 .EXAMPLE
   ./install-service.ps1 -AllowUser you@example.com

@@ -43,6 +43,8 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 /// The link thread changed [`Shared`].
 const WM_APP_UPDATE: u32 = WM_APP + 2;
 const TRAY_ID: u32 = 1;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const TIMER_AUTOSTART: usize = 1;
 const TIMER_RETRY_UPDATE: usize = 2;
 /// How long to wait for an existing host (a service worker may be starting) before starting
@@ -129,14 +131,26 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 /// Work done after the app borrow is released because it may pump messages.
 enum Deferred {
     Open(PathBuf),
+    EditElevated(PathBuf),
+    RestartService,
 }
 
 impl Deferred {
     fn run(self) {
         match self {
             Deferred::Open(path) => host::open(&path),
+            Deferred::EditElevated(path) => host::edit_elevated(&path),
+            Deferred::RestartService => host::restart_service(),
         }
     }
+}
+
+/// The host's log: the one it reports (the service worker writes its own), else the file the
+/// tray sends a console host's output to.
+fn log_path(status: Option<&HostStatus>) -> Option<PathBuf> {
+    status
+        .and_then(|s| s.log_path.as_ref().map(PathBuf::from))
+        .or_else(host::log_path)
 }
 
 /// Appends panics to `%LOCALAPPDATA%\PeetConnect\tray.log`: the tray has no console, and a
@@ -456,7 +470,11 @@ impl App {
         self.menu_sessions.clear();
         match &status {
             None => {
-                item(MF_STRING | MF_GRAYED, 0, "PeetConnect: host not running")?;
+                item(
+                    MF_STRING | MF_GRAYED,
+                    0,
+                    &format!("PeetConnect {VERSION}: host not running"),
+                )?;
             }
             Some(s) => {
                 let service = if s.mode == HostMode::ServiceWorker {
@@ -464,10 +482,16 @@ impl App {
                 } else {
                     ""
                 };
+                // The host is normally the same version; say so when it is not.
+                let host_version = if s.version == VERSION {
+                    String::new()
+                } else {
+                    format!(", host {}", s.version)
+                };
                 item(
                     MF_STRING | MF_GRAYED,
                     0,
-                    &format!("PeetConnect: {}{service}", s.name),
+                    &format!("PeetConnect {VERSION}: {}{service}{host_version}", s.name),
                 )?;
                 item(MF_STRING | MF_GRAYED, 0, &state_line(s))?;
                 separator()?;
@@ -505,13 +529,15 @@ impl App {
                     item(MF_STRING, CMD_RESTART, "Restart host")?;
                 }
                 item(MF_STRING, CMD_STOP, "Stop host")?;
+            } else {
+                item(MF_STRING, CMD_RESTART, "Restart service")?;
             }
         } else {
             item(MF_STRING, CMD_START, "Start host")?;
         }
         separator()?;
         item(MF_STRING, CMD_CONFIG, "Open configuration")?;
-        let log_exists = host::log_path().is_some_and(|p| p.exists());
+        let log_exists = log_path(status.as_ref()).is_some_and(|p| p.exists());
         item(
             if log_exists {
                 MF_STRING
@@ -552,10 +578,23 @@ impl App {
             CMD_START => self.start_host(),
             CMD_STOP => self.stop_host(),
             CMD_RESTART => {
+                if status.is_some_and(|s| s.mode == HostMode::ServiceWorker) {
+                    return Some(Deferred::RestartService);
+                }
                 self.stop_host();
                 self.start_host();
             }
             CMD_CONFIG => {
+                if let Some(s) = status
+                    .as_ref()
+                    .filter(|s| s.mode == HostMode::ServiceWorker)
+                {
+                    // Machine-wide and admin-only; the service created it at install.
+                    return s
+                        .config_path
+                        .as_ref()
+                        .map(|p| Deferred::EditElevated(PathBuf::from(p)));
+                }
                 let path = status
                     .and_then(|s| s.config_path.map(PathBuf::from))
                     .or_else(host::default_config_path);
@@ -568,7 +607,7 @@ impl App {
                     }
                 }
             }
-            CMD_LOG => return host::log_path().map(Deferred::Open),
+            CMD_LOG => return log_path(status.as_ref()).map(Deferred::Open),
             CMD_AUTOSTART => {
                 if let Err(err) = host::set_autostart(!host::autostart_enabled()) {
                     self.balloon("Could not change Start with Windows", &format!("{err:#}"));

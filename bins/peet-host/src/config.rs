@@ -1,7 +1,8 @@
 //! Host configuration: a TOML file with command-line overrides.
 //!
 //! The file lives at `%APPDATA%\PeetConnect\host.toml` (or `~/.config/PeetConnect/host.toml`)
-//! unless `--config` says otherwise. Every key is optional. Example:
+//! for a console host and at `%ProgramData%\PeetConnect\host.toml` for the service and its
+//! worker, unless `--config` says otherwise. Every key is optional. Example:
 //!
 //! ```toml
 //! port = 7735
@@ -23,52 +24,125 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<IpAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
+    #[serde(skip_serializing_if = "is_default")]
     pub allow: AllowConfig,
+    #[serde(skip_serializing_if = "is_default")]
     pub video: VideoConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AllowConfig {
     /// Tailscale login names, e.g. `alice@example.com`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub users: Vec<String>,
     /// ACL tags, e.g. `tag:admin`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     /// Node stable IDs or MagicDNS host names.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<String>,
     /// Accept every node on the tailnet.
+    #[serde(skip_serializing_if = "is_default")]
     pub any_tailnet: bool,
     /// Accept connections from this machine (loopback). For development only.
+    #[serde(skip_serializing_if = "is_default")]
     pub local: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bitrate_kbps: Option<u32>,
     /// `auto`, `dxgi` or `gdi`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<String>,
 }
 
-pub fn default_path() -> Option<PathBuf> {
+impl FileConfig {
+    /// The settings given as command-line flags, for writing into a new file.
+    pub fn from_cli(cli: &crate::Cli) -> Self {
+        Self {
+            bind: cli.bind,
+            port: cli.port,
+            name: cli.name.clone(),
+            pin: cli.pin.clone(),
+            allow: AllowConfig {
+                users: cli.allow_user.clone(),
+                tags: cli.allow_tag.clone(),
+                nodes: cli.allow_node.clone(),
+                any_tailnet: cli.allow_any_tailnet,
+                local: cli.allow_local,
+            },
+            video: VideoConfig {
+                fps: cli.fps,
+                max_bitrate_kbps: cli.bitrate_kbps,
+                capture: cli.capture.clone(),
+            },
+        }
+    }
+
+    /// A new configuration file: a header explaining the keys, then these settings.
+    pub fn to_file_text(&self) -> Result<String> {
+        let body = toml::to_string(self).context("formatting the configuration")?;
+        Ok(format!("{TEMPLATE_HEADER}\n{body}"))
+    }
+}
+
+const TEMPLATE_HEADER: &str = "\
+# PeetConnect host configuration. Restart the host after editing.
+#
+# port = 7735
+# name = \"studio-pc\"
+# pin = \"4821\"            # required in addition to tailnet identity
+#
+# [allow]                 # who may connect; nobody is admitted without a rule
+# users = [\"alice@example.com\"]
+# tags = [\"tag:admin\"]
+# nodes = [\"laptop\"]
+# any_tailnet = false
+#
+# [video]
+# fps = 60
+# max_bitrate_kbps = 12000
+# capture = \"auto\"        # auto | dxgi | gdi
+";
+
+/// The default file: per-user for a console host, machine-wide for the service and its worker.
+pub fn default_path(machine: bool) -> Option<PathBuf> {
+    #[cfg(windows)]
+    if machine {
+        return Some(crate::machine::config_path());
+    }
+    let _ = machine;
     dirs::config_dir().map(|d| d.join("PeetConnect").join("host.toml"))
 }
 
 /// Loads the file at `path`, or the default location. A missing default file is not an error.
-pub fn load(path: Option<&Path>) -> Result<(FileConfig, Option<PathBuf>)> {
+pub fn load(path: Option<&Path>, machine: bool) -> Result<(FileConfig, Option<PathBuf>)> {
     let (path, required) = match path {
         Some(p) => (Some(p.to_path_buf()), true),
-        None => (default_path(), false),
+        None => (default_path(machine), false),
     };
     let Some(path) = path else {
         return Ok((FileConfig::default(), None));
@@ -162,6 +236,28 @@ mod tests {
         assert_eq!(config.port, Some(8000));
         assert_eq!(config.allow.users, vec!["a@b.c".to_string()]);
         assert_eq!(config.video.fps, Some(30));
+    }
+
+    #[test]
+    fn written_file_reads_back() {
+        let config = FileConfig {
+            pin: Some("4821".into()),
+            allow: AllowConfig {
+                users: vec!["a@b.c".into()],
+                ..AllowConfig::default()
+            },
+            ..FileConfig::default()
+        };
+        let text = config.to_file_text().unwrap();
+        assert!(
+            !text.contains("\n[video]"),
+            "empty tables are left out:\n{text}"
+        );
+        assert_eq!(toml::from_str::<FileConfig>(&text).unwrap(), config);
+        assert_eq!(
+            toml::from_str::<FileConfig>(&FileConfig::default().to_file_text().unwrap()).unwrap(),
+            FileConfig::default()
+        );
     }
 
     #[test]

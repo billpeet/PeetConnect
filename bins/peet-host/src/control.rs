@@ -130,6 +130,12 @@ fn status(state: &HostState, listen: &str) -> HostStatus {
         admits_anyone: state.config.admits_anyone(),
         pin_required: state.config.pin.is_some(),
         config_path: hub.config_path.as_ref().map(|p| p.display().to_string()),
+        log_path: state.config.follow_desktop.then(|| {
+            crate::machine::log_dir()
+                .join("host.log")
+                .display()
+                .to_string()
+        }),
         sessions: hub
             .sessions
             .lock()

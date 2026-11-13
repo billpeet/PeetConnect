@@ -40,6 +40,7 @@ use windows::Win32::System::Threading::{
     STARTUPINFOW,
 };
 
+use crate::config::{AllowConfig, FileConfig};
 use crate::Cli;
 
 const SERVICE_NAME: &str = "PeetConnect";
@@ -72,20 +73,51 @@ fn worker_command_line() -> Result<Vec<u16>> {
     Ok(to_wide(&parts.join(" ")))
 }
 
-/// The command line stored in the service's binary path: our path with `--install` swapped for
-/// `--service`, so the service re-runs with the same configuration flags.
-fn service_bin_path() -> Result<String> {
+/// The command line stored in the service's binary path. Settings live in the configuration
+/// file, so only an explicit `--config` is carried over.
+fn service_bin_path(cli: &Cli) -> Result<String> {
     let exe = std::env::current_exe().context("finding our own path")?;
-    let mut parts = vec![quote(&exe.to_string_lossy())];
-    for arg in std::env::args().skip(1) {
-        let mapped = if arg == "--install" {
-            "--service".to_string()
-        } else {
-            arg
-        };
-        parts.push(quote(&mapped));
+    let mut parts = vec![quote(&exe.to_string_lossy()), "--service".to_string()];
+    if let Some(config) = &cli.config {
+        let config = std::path::absolute(config).context("resolving --config")?;
+        parts.push("--config".to_string());
+        parts.push(quote(&config.to_string_lossy()));
     }
     Ok(parts.join(" "))
+}
+
+/// Secures `%ProgramData%\PeetConnect` and writes the configuration file from the command-line
+/// flags if it does not exist. An existing file is left alone; flags alongside it are an error,
+/// since they would otherwise be silently ignored.
+fn prepare_config(cli: &Cli) -> Result<()> {
+    crate::machine::secure()?;
+    let path = cli
+        .config
+        .clone()
+        .unwrap_or_else(crate::machine::config_path);
+    let flags = FileConfig::from_cli(cli);
+    if path.exists() {
+        anyhow::ensure!(
+            flags == FileConfig::default(),
+            "{} already exists; edit it instead of passing settings to --install",
+            path.display()
+        );
+        tracing::info!(path = %path.display(), "keeping the existing configuration");
+    } else {
+        if flags.allow == AllowConfig::default() {
+            tracing::warn!(
+                "no --allow-* rule given: the service will admit nobody until {} has one",
+                path.display()
+            );
+        }
+        std::fs::write(&path, flags.to_file_text()?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        tracing::info!(path = %path.display(), "wrote the service configuration");
+    }
+    if path.starts_with(crate::machine::dir()) {
+        crate::machine::secure_config(&path)?;
+    }
+    Ok(())
 }
 
 fn quote(s: &str) -> String {
@@ -97,8 +129,9 @@ fn quote(s: &str) -> String {
 }
 
 /// Registers the service with the SCM, set to start at boot as LocalSystem.
-pub fn install(_cli: &Cli) -> Result<()> {
-    let bin_path = service_bin_path()?;
+pub fn install(cli: &Cli) -> Result<()> {
+    prepare_config(cli)?;
+    let bin_path = service_bin_path(cli)?;
     // SAFETY: Win32 SCM calls with owned wide strings; handles are closed on drop paths below.
     unsafe {
         let scm = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CREATE_SERVICE)

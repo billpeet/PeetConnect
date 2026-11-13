@@ -13,7 +13,7 @@ use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
@@ -72,6 +72,39 @@ pub fn open(path: &Path) {
     if result.0 as usize <= 32 {
         let _ = Command::new("notepad.exe").arg(path).spawn();
     }
+}
+
+/// Opens the service's configuration in Notepad as administrator: the file is writable only
+/// by SYSTEM and Administrators. Declining the UAC prompt just does nothing.
+pub fn edit_elevated(path: &Path) {
+    let args = HSTRING::from(format!("\"{}\"", path.display()));
+    // SAFETY: plain shell call with valid NUL-terminated strings.
+    let _ = unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            w!("notepad.exe"),
+            &args,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+}
+
+/// Restarts the service through an elevated, hidden PowerShell (the tray itself never runs
+/// elevated). Declining the UAC prompt just does nothing.
+pub fn restart_service() {
+    // SAFETY: plain shell call with valid NUL-terminated strings.
+    let _ = unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            w!("powershell.exe"),
+            w!("-NoProfile -WindowStyle Hidden -Command Restart-Service PeetConnect"),
+            None,
+            SW_HIDE,
+        )
+    };
 }
 
 /// Creates the host configuration file with a commented template if it does not exist yet.

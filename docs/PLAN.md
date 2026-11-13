@@ -280,10 +280,26 @@ Not done: file transfer, per-monitor bitrate budgeting in all-monitors mode (eac
 stream keeps the full cap), remembering a PIN per host. Exit — replaces AnyDesk for personal use — is close for the viewer side; the service still
 needs an administrator to verify unattended use (neither test machine's user is one).
 
-**M7 — Packaging, releases and updates.** (planned) One Inno Setup installer for all binaries,
+**M7 — Packaging, releases and updates.** (in progress) One Inno Setup installer for all binaries,
 per-user by default and per-machine with the service when run as administrator; tag-triggered
 release builds on GitHub Actions; a signed update manifest on GitHub Releases, applied
 automatically when idle. Plan: [PACKAGING.md](PACKAGING.md).
+
+*Work items 1–2 (2026-11-13)* — Versions: every binary already had `--version` except the tray,
+which has no console, so its menu header shows its version instead (and the host's when they
+differ). Service configuration: the service and its worker read
+`%ProgramData%\PeetConnect\host.toml` and log to `%ProgramData%\PeetConnect\logs` (`service.log`,
+`host.log`); `HostStatus.log_path` tells the tray. `--install` stores only `--service` (and an
+explicit `--config`) in the service command line, writes the given flags into a new file, and
+refuses flags when the file already exists. The folder is reset to Administrators-owned with
+SYSTEM/Administrators full control and Users read (`TreeResetNamedSecurityInfoW`, so a folder a
+user pre-created is taken over), and `host.toml` is SYSTEM/Administrators only because it may hold
+the PIN; the service repairs this at every start. Tray: "Open configuration" opens Notepad
+elevated and "Restart service" runs an elevated `Restart-Service` when the host is the service.
+Verified: config round-trip test; unelevated `--install` fails cleanly at taking ownership; a
+hand-started `--session-worker` with `ProgramData` redirected read the machine file, logged to
+`logs\host.log` and reported both paths over the pipe. Not verified: an elevated install and the
+real service (no administrator on either test machine).
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.

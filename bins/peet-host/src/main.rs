@@ -18,7 +18,8 @@ mod config;
 #[command(name = "peet-host", version, about = "PeetConnect host")]
 #[allow(clippy::struct_excessive_bools)] // a CLI naturally has many on/off flags
 pub struct Cli {
-    /// Configuration file (default: %APPDATA%\PeetConnect\host.toml).
+    /// Configuration file (default: %APPDATA%\PeetConnect\host.toml; for the service,
+    /// %ProgramData%\PeetConnect\host.toml).
     #[arg(long)]
     config: Option<PathBuf>,
     /// Address to listen on. Default: all interfaces; non-tailnet peers are rejected anyway.
@@ -59,7 +60,8 @@ pub struct Cli {
     /// Run in the foreground attached to this console.
     #[arg(long)]
     console: bool,
-    /// Install the Windows service (requires an elevated prompt). Other flags are baked in.
+    /// Install the Windows service (requires an elevated prompt). Settings given as flags are
+    /// written to %ProgramData%\PeetConnect\host.toml when that file does not exist yet.
     #[arg(long)]
     install: bool,
     /// Remove the Windows service (requires an elevated prompt).
@@ -74,19 +76,16 @@ pub struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
-    let (file, path) = config::load(cli.config.as_deref())?;
+    // The service and its worker have no console: they log to %ProgramData%\PeetConnect\logs.
+    let machine = cli.service || cli.session_worker || cli.install;
+    init_logging(&cli);
+    let (file, path) = config::load(cli.config.as_deref(), machine)?;
     if let Some(path) = &path {
         tracing::info!(path = %path.display(), "loaded configuration");
     }
     let config = config::HostConfig::resolve(file, &cli);
-    let config_path = path.or_else(config::default_path);
+    let config_path = path.or_else(|| config::default_path(machine));
     #[cfg(windows)]
     {
         if cli.install {
@@ -107,6 +106,47 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn init_logging(cli: &Cli) {
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    #[cfg(windows)]
+    {
+        let log_name = if cli.service {
+            Some("service.log")
+        } else if cli.session_worker {
+            Some("host.log")
+        } else {
+            None
+        };
+        if let Some(name) = log_name {
+            // The service starts first, as SYSTEM: it repairs the folder before anything is
+            // written there. A failure is logged once logging works rather than being fatal.
+            let secured = if cli.service {
+                machine::secure()
+            } else {
+                Ok(())
+            };
+            if let Ok(file) = machine::open_log(name) {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .init();
+                if let Err(err) = secured {
+                    tracing::warn!("{err:#}");
+                }
+                return;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = cli;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 #[cfg(windows)]
 mod auth;
 #[cfg(windows)]
@@ -115,6 +155,8 @@ mod clipboard;
 mod control;
 #[cfg(windows)]
 mod desktop;
+#[cfg(windows)]
+mod machine;
 #[cfg(windows)]
 mod screenshot;
 #[cfg(windows)]
