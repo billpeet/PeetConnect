@@ -29,6 +29,8 @@ peet-codec.workspace = true
 peet-control.workspace = true
 peet-tailscale.workspace = true
 peet-transport.workspace = true
+peet-update.workspace = true
+serde_json.workspace = true
 image.workspace = true
 windows.workspace = true
 

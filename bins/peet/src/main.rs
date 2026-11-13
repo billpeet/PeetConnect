@@ -15,6 +15,7 @@ use peet_proto::{Codec, InputEvent, MouseButton};
 use peet_tailscale::{LocalApi, PeerStatus, Status};
 
 mod mcp;
+mod update;
 
 #[derive(Debug, Parser)]
 #[command(name = "peet", version, about = "PeetConnect remote desktop CLI")]
@@ -141,6 +142,12 @@ enum Command {
     },
     /// Run a Model Context Protocol server on stdio so an agent can drive hosts as tools.
     Mcp,
+    /// Check for a newer PeetConnect release and install it now.
+    Update {
+        /// Only report whether an update is available.
+        #[arg(long)]
+        check: bool,
+    },
     /// Print protocol constants for this build.
     Version,
 }
@@ -472,6 +479,10 @@ async fn main() -> Result<()> {
         }
         Command::Mcp => {
             mcp::serve().await?;
+        }
+        Command::Update { check } => {
+            let json = cli.json;
+            tokio::task::spawn_blocking(move || update::run(check, json)).await??;
         }
         Command::Version => {
             if cli.json {

@@ -16,6 +16,8 @@ mod app;
 mod host;
 #[cfg(windows)]
 mod link;
+#[cfg(windows)]
+mod update;
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {

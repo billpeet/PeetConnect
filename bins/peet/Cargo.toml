@@ -12,6 +12,7 @@ peet-core.workspace = true
 peet-input.workspace = true
 peet-proto.workspace = true
 peet-tailscale.workspace = true
+peet-update.workspace = true
 
 anyhow.workspace = true
 base64.workspace = true

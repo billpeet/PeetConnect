@@ -18,6 +18,9 @@
 //! fps = 60
 //! max_bitrate_kbps = 12000
 //! capture = "auto"   # auto | dxgi | gdi
+//!
+//! [update]
+//! automatic = true    # the service installs updates by itself (per-machine installs)
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,6 +44,8 @@ pub struct FileConfig {
     pub allow: AllowConfig,
     #[serde(skip_serializing_if = "is_default")]
     pub video: VideoConfig,
+    #[serde(skip_serializing_if = "is_default")]
+    pub update: UpdateConfig,
 }
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
@@ -79,6 +84,16 @@ pub struct VideoConfig {
     pub capture: Option<String>,
 }
 
+/// Updates of a per-machine install, which the service applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Install a downloaded update by itself once nothing is in use (the default). When false
+    /// it waits for `peet update` or the tray's "Install now".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic: Option<bool>,
+}
+
 impl FileConfig {
     /// The settings given as command-line flags, for writing into a new file.
     pub fn from_cli(cli: &crate::Cli) -> Self {
@@ -99,6 +114,7 @@ impl FileConfig {
                 max_bitrate_kbps: cli.bitrate_kbps,
                 capture: cli.capture.clone(),
             },
+            update: UpdateConfig::default(),
         }
     }
 
@@ -126,6 +142,9 @@ const TEMPLATE_HEADER: &str = "\
 # fps = 60
 # max_bitrate_kbps = 12000
 # capture = \"auto\"        # auto | dxgi | gdi
+#
+# [update]                # per-machine installs, updated by the service
+# automatic = true        # false: download, but wait for `peet update` to install
 ";
 
 /// The default file: per-user for a console host, machine-wide for the service and its worker.
@@ -173,6 +192,8 @@ pub struct HostConfig {
     /// True when running as the service worker: capture and input threads follow the active
     /// input desktop so they keep working across the secure desktop.
     pub follow_desktop: bool,
+    /// The service installs downloaded updates by itself.
+    pub auto_update: bool,
 }
 
 impl HostConfig {
@@ -209,6 +230,7 @@ impl HostConfig {
                 .or(file.video.capture)
                 .unwrap_or_else(|| "auto".into()),
             follow_desktop: cli.session_worker,
+            auto_update: file.update.automatic.unwrap_or(true),
         }
     }
 

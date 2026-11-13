@@ -335,6 +335,24 @@ with the installer, zip, `latest.json(.sig)` and `SHA256SUMS`; the installer's h
 matched the manifest. Decided the same day: openh264 stays out of release builds (see "Known hard
 parts").
 
+*Work item 5 (2026-11-13)* — `crates/peet-update`: manifest fetch over WinHTTP (system TLS and
+proxy, follows GitHub's redirect), ed25519 check against the compiled-in key, semver comparison,
+download with size and SHA-256 check (file held open read-only from verification to launch),
+install-folder detection from Inno's uninstall key (dev builds and portable copies never update),
+blocking processes (`peet-viewer.exe`, `peet.exe` from the install folder), detached installer
+launch. Tray (per-user): checks 2 min after start then every 6 h plus jitter, installs silently
+when idle, "Install now", "Check for updates", "Install updates automatically" (HKCU), "Updated
+to …" balloon from `HKCU\Software\PeetConnect\LastVersion`, nag after 3 days, failures quiet for a
+day. Service (per-machine): same schedule, stages in `%ProgramData%\PeetConnect\updates`, writes
+`update.json` for the tray, which quits when it says `installing`; the restarted service starts
+the trays again in their sessions; `[update] automatic` in host.toml. `peet update [--check]`.
+`PEETCONNECT_UPDATE_MANIFEST` overrides the manifest URL for testing (signature still required).
+Verified on this machine: a per-user 0.2.0 install found a locally served, really signed
+`0.2.1-test.1`, downloaded, verified, installed it silently and came back with tray and host;
+`peet update --check` against GitHub. Not verified: the per-machine path (no administrator), and a
+real release (needs `v0.2.1`; installs of the published 0.2.0 have no updater and update by hand
+once).
+
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.
 

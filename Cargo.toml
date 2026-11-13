@@ -18,6 +18,7 @@ peet-input = { path = "crates/peet-input" }
 peet-proto = { path = "crates/peet-proto" }
 peet-tailscale = { path = "crates/peet-tailscale" }
 peet-transport = { path = "crates/peet-transport" }
+peet-update = { path = "crates/peet-update" }
 peet-winres = { path = "crates/peet-winres" }
 
 anyhow = "1.0"
@@ -32,6 +33,7 @@ hyper = { version = "1.12", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 openh264 = "0.9"
 postcard = { version = "1.1", features = ["use-std"] }
+ring = "0.17"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
@@ -51,11 +53,14 @@ windows = { version = "0.62", features = [
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
   "Win32_Media_MediaFoundation",
+  "Win32_Networking_WinHttp",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_Console",
   "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Environment",
   "Win32_System_Memory",
   "Win32_System_LibraryLoader",

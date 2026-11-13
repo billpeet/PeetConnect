@@ -28,7 +28,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use crate::repo_root;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const REPOSITORY: &str = "billpeet/peetconnect";
+const REPOSITORY: &str = "billpeet/PeetConnect";
 
 pub fn check_tag(args: &[String]) -> Result<()> {
     let [tag] = args else {
@@ -132,7 +132,13 @@ pub fn release(args: &[String]) -> Result<()> {
 }
 
 pub fn manifest(args: &[String]) -> Result<()> {
-    ensure!(args.is_empty(), "usage: cargo xtask manifest");
+    // --base-url points the installer URL somewhere else, for testing the updater against a
+    // local server (clients accept plain http only when PEETCONNECT_UPDATE_MANIFEST is set).
+    let base = match args {
+        [] => format!("https://github.com/{REPOSITORY}/releases/download/v{VERSION}"),
+        [flag, url] if flag == "--base-url" => url.trim_end_matches('/').to_string(),
+        _ => bail!("usage: cargo xtask manifest [--base-url <url>]"),
+    };
     let dist = repo_root().join("target").join("dist");
     let installer_name = format!("PeetConnect-{VERSION}-setup.exe");
     let installer = fs::read(dist.join(&installer_name))
@@ -143,7 +149,7 @@ pub fn manifest(args: &[String]) -> Result<()> {
         "published": now_rfc3339(),
         "notes": format!("https://github.com/{REPOSITORY}/releases/tag/v{VERSION}"),
         "installer": {
-            "url": format!("https://github.com/{REPOSITORY}/releases/download/v{VERSION}/{installer_name}"),
+            "url": format!("{base}/{installer_name}"),
             "sha256": hex(ring::digest::digest(&ring::digest::SHA256, &installer).as_ref()),
             "size": installer.len(),
         },

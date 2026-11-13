@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
             return service::uninstall();
         }
         if cli.service {
-            return service::run_service();
+            return service::run_service(config.auto_update);
         }
         host::run(config, config_path)
     }
@@ -165,6 +165,8 @@ mod service;
 mod session;
 #[cfg(windows)]
 mod stream;
+#[cfg(windows)]
+mod update;
 
 #[cfg(windows)]
 mod host {

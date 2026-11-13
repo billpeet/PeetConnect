@@ -5,6 +5,15 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+### Added
+
+- Automatic updates. Installed copies check GitHub for a newer signed release, download it in
+  the background and install it silently once no viewer is connected and no viewer window or
+  `peet` command is running. Per-user installs are updated by the tray, which can switch to
+  notify-only ("Install updates automatically"); per-machine installs are updated by the service
+  (`[update] automatic = false` in host.toml to wait instead). `peet update` installs now and
+  `peet update --check` only reports. Installs of 0.2.0 have to be updated by hand once.
+
 ## 0.2.0 - 2026-11-13
 
 First packaged release.
