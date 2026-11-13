@@ -181,6 +181,14 @@ async fn control_loop(
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMessage>(256);
     let mut streams: HashMap<SourceId, VideoStream> = HashMap::new();
     let session_start = Instant::now();
+    // Sleeping displays are composed only a few times a second; wake them and keep them on.
+    let _awake = if state.config.wake_display {
+        let follow_desktop = state.config.follow_desktop;
+        tokio::task::spawn_blocking(move || crate::display::wake(follow_desktop));
+        crate::display::KeepAwake::new()
+    } else {
+        None
+    };
     tokio::spawn(accept_input_streams(
         connection.clone(),
         session_id,

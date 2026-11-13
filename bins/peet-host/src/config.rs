@@ -77,6 +77,11 @@ pub struct VideoConfig {
     /// `auto`, `dxgi`, `wgc` or `gdi`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<String>,
+    /// Wake the displays when a viewer connects and keep them (and the machine) awake until
+    /// it leaves. Sleeping displays are composed only a few times a second, so capture
+    /// crawls. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_display: Option<bool>,
 }
 
 impl FileConfig {
@@ -98,6 +103,7 @@ impl FileConfig {
                 fps: cli.fps,
                 max_bitrate_kbps: cli.bitrate_kbps,
                 capture: cli.capture.clone(),
+                wake_display: None,
             },
         }
     }
@@ -170,6 +176,8 @@ pub struct HostConfig {
     pub fps: u32,
     pub max_bitrate_kbps: u32,
     pub capture: String,
+    /// See [`VideoConfig::wake_display`].
+    pub wake_display: bool,
     /// True when running as the service worker: capture and input threads follow the active
     /// input desktop so they keep working across the secure desktop.
     pub follow_desktop: bool,
@@ -208,6 +216,7 @@ impl HostConfig {
                 .clone()
                 .or(file.video.capture)
                 .unwrap_or_else(|| "auto".into()),
+            wake_display: file.video.wake_display.unwrap_or(true),
             follow_desktop: cli.session_worker,
         }
     }

@@ -112,6 +112,10 @@ independent implementation (Python `dxcam`). GDI works, so this is machine/drive
 needs a capture watchdog that falls back to GDI (the bench already does this), and we should
 evaluate Windows.Graphics.Capture as a third backend. DXGI timings are therefore still
 unmeasured here; expect ~1 ms per frame when it works.
+*Probable cause, found 2026-11-14:* the displays had gone to sleep. After a long idle
+DWM composes only a few times a second, DXGI delivers nothing and WGC about 4 fps; a
+zero-distance mouse move brings both back to full rate. The host now wakes the displays at
+session start and keeps them on (see M8, frame rate).
 
 **M2 — Loopback viewer + GPUI spike. Done 2026-11-12.** `peet-codec` gained a Media Foundation
 H.264 decoder with DXVA output (NV12 D3D11 textures) and a general `GpuConverter`
@@ -414,8 +418,8 @@ answered in 50–110 ms. `Auto` is now DXGI → WGC → GDI, each step after 1.5
 the service worker (`follow_desktop`) uses `Backend::AutoNoWgc`, the old DXGI → GDI chain, until
 WGC is tested from SYSTEM and across a secure-desktop switch. Verified by forcing DXGI silent
 (temporary patch, reverted): the bench switched to WGC after 1.5 s and ran at 44 fps. Note: DXGI
-Desktop Duplication now delivers frames on the dev box (the M1 open issue no longer reproduces,
-39 fps on DISPLAY2), so `Auto` stays on DXGI there.
+Desktop Duplication now delivers frames on the dev box (39 fps on DISPLAY2), so `Auto` stays on
+DXGI there. The M1 open issue was probably sleeping displays; see the frame-rate note below.
 
 *Work items 2–4 (2026-11-13)* — Protocol v2 (`PROTOCOL_VERSION` 2; hellos unchanged, so a v1
 peer gets a clean `UnsupportedProtocolVersion`): `SourceId::{Monitor, Window}` in `VideoFrame`,
@@ -460,9 +464,24 @@ title mirrors the remote window's title. `peet-viewer --window <id|title>` opens
 window, and reconnects return to the shown window. Verified with `peet-bench testwindow` and
 `--window`: the stream showed, a move and a resize were followed, the minimised card appeared and
 cleared on restore, and the closed card appeared. Not yet exercised by hand: clicking through
-the picker, and input into a window stream. Seen: the host sent only 1–5 fps of the animated
-test window while the viewer covered it, against ~26 fps in the earlier probe. Check whether DWM
-throttles covered windows, or whether it was the debug build.
+the picker, and input into a window stream.
+
+*Frame rate (2026-11-14)*: the host once sent only 1–5 fps of the animated test window, against
+~26 fps earlier. Neither covering the window nor the debug build was the cause. The whole
+machine was in a slow state after 13 hours idle with the displays asleep:
+- Measured: WGC 3.9 fps and DXGI 0 fps, for windows and monitors alike.
+- A zero-distance `SendInput` mouse move restored WGC to 43.9 fps and DXGI to 39.2 fps.
+- `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` does not wake displays that are already off.
+- Not reproduced on demand: turning the displays off with `SC_MONITORPOWER`, 330 s idle past
+  the 300 s display timeout, and a further hour of idle all kept capture at 37–40 fps. The slow
+  state seems to need the monitors to power down fully, which takes longer.
+
+Fix (`peet-host/src/display.rs`): each session starts with a zero-distance mouse move (input
+wakes the displays; the cursor does not move), then holds display-required and system-required
+power requests until it ends. `[video] wake_display = false` turns this off. When the displays
+were already off, the first frame came about 1 s later (1.5 s against 0.57 s from session start),
+while they powered up. The fix rests on the measured recovery after input; it has not been run
+against a reproduced slow state.
 
 *Work item 6 (2026-11-13)*:
 - **Protocol:** `ResizeWindow { window, width, height }` sets a window's visible size and keeps
@@ -499,8 +518,9 @@ Android viewer.
 - GPUI on Windows: API churn and sparse docs. Pin a version; isolate UI from peet-core.
 - GPUI has no surface/texture element on Windows and its window has no redirection bitmap:
   video must go through DirectComposition (see M2). Do not try child HWNDs again.
-- DXGI duplication can silently deliver nothing (seen on the dev box). Always keep a GDI
-  fallback behind a watchdog, and consider Windows.Graphics.Capture.
+- DXGI duplication can silently deliver nothing. On the dev box this was probably sleeping
+  displays (WGC also drops to ~4 fps then); the host wakes them and keeps them on during a
+  session. Still keep the GDI and WGC fallbacks behind the watchdog.
 - Hardware MFTs are per-vendor; on multi-GPU machines try each until one accepts the device.
 - openh264 ships as a Cisco binary for the patent licence; bundling must follow their terms.
   Decided 2026-11-13: release builds leave it out (off-by-default `peet-codec` feature

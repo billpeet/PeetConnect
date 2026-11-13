@@ -156,6 +156,8 @@ mod control;
 #[cfg(windows)]
 mod desktop;
 #[cfg(windows)]
+mod display;
+#[cfg(windows)]
 mod machine;
 #[cfg(windows)]
 mod screenshot;
