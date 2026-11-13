@@ -5,6 +5,8 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-13
+
 First packaged release.
 
 ### Added

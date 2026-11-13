@@ -4069,7 +4069,7 @@ dependencies = [
 
 [[package]]
 name = "peet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -4088,7 +4088,7 @@ dependencies = [
 
 [[package]]
 name = "peet-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "peet-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "peet-proto",
  "thiserror 2.0.21",
@@ -4111,7 +4111,7 @@ dependencies = [
 
 [[package]]
 name = "peet-codec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "openh264",
  "thiserror 2.0.21",
@@ -4121,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "peet-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4131,7 +4131,7 @@ dependencies = [
 
 [[package]]
 name = "peet-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gethostname",
  "peet-proto",
@@ -4143,7 +4143,7 @@ dependencies = [
 
 [[package]]
 name = "peet-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4169,7 +4169,7 @@ dependencies = [
 
 [[package]]
 name = "peet-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "peet-proto",
  "thiserror 2.0.21",
@@ -4179,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "peet-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "postcard",
  "serde",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "peet-tailscale"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -4203,7 +4203,7 @@ dependencies = [
 
 [[package]]
 name = "peet-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "peet-proto",
@@ -4218,7 +4218,7 @@ dependencies = [
 
 [[package]]
 name = "peet-tray"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "peet-viewer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "peet-winres"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "embed-resource",
 ]
@@ -7711,7 +7711,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
