@@ -348,3 +348,5 @@ Android viewer.
   fallback behind a watchdog, and consider Windows.Graphics.Capture.
 - Hardware MFTs are per-vendor; on multi-GPU machines try each until one accepts the device.
 - openh264 ships as a Cisco binary for the patent licence; bundling must follow their terms.
+  Decided 2026-11-13: release builds leave it out (off-by-default `peet-codec` feature
+  `openh264`, enabled by `peet-bench` only); see PACKAGING.md.

@@ -6,15 +6,18 @@
 //!   their MFTs) or Microsoft's software MFT. Accepts GPU textures for a zero-copy path.
 //! * [`windows::MfH264Decoder`]: Media Foundation H.264 decoder with DXVA, producing NV12
 //!   D3D11 textures.
-//! * [`OpenH264Encoder`]: Cisco's openh264, pure CPU, works everywhere. The fallback.
+//! * `OpenH264Encoder` (feature `openh264`, off by default): Cisco's openh264 compiled from
+//!   source, pure CPU. Kept for benchmarks; release builds leave it out (see `Cargo.toml`).
 //!
 //! Output is Annex B H.264 (start-code delimited NAL units), one access unit per packet.
 
 pub mod nv12;
+#[cfg(feature = "openh264")]
 mod openh264_enc;
 #[cfg(windows)]
 pub mod windows;
 
+#[cfg(feature = "openh264")]
 pub use openh264_enc::OpenH264Encoder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +66,7 @@ impl From<::windows::core::Error> for CodecError {
     }
 }
 
+#[cfg(feature = "openh264")]
 impl From<openh264::Error> for CodecError {
     fn from(err: openh264::Error) -> Self {
         CodecError::Encoder(err.to_string())
@@ -89,12 +93,27 @@ pub trait VideoEncoder: Send {
 /// Which encoder to construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EncoderKind {
-    /// Hardware Media Foundation, then software Media Foundation, then openh264.
+    /// Hardware Media Foundation, then software Media Foundation, then openh264 when built in.
     #[default]
     Auto,
     MediaFoundationHardware,
     MediaFoundationSoftware,
     OpenH264,
+}
+
+/// The openh264 encoder, or `Unavailable` when this build leaves it out.
+fn openh264(config: &EncoderConfig) -> Result<Box<dyn VideoEncoder>, CodecError> {
+    #[cfg(feature = "openh264")]
+    {
+        Ok(Box::new(OpenH264Encoder::new(config)?))
+    }
+    #[cfg(not(feature = "openh264"))]
+    {
+        let _ = config;
+        Err(CodecError::Unavailable(
+            "openh264 is not built in (enable the peet-codec `openh264` feature)".into(),
+        ))
+    }
 }
 
 /// Builds a system-memory encoder of the requested kind.
@@ -103,7 +122,7 @@ pub fn create_encoder(
     config: &EncoderConfig,
 ) -> Result<Box<dyn VideoEncoder>, CodecError> {
     match kind {
-        EncoderKind::OpenH264 => Ok(Box::new(OpenH264Encoder::new(config)?)),
+        EncoderKind::OpenH264 => openh264(config),
         #[cfg(windows)]
         EncoderKind::MediaFoundationHardware => {
             Ok(Box::new(windows::MfH264Encoder::new(config, true, None)?))
@@ -114,18 +133,26 @@ pub fn create_encoder(
         }
         #[cfg(windows)]
         EncoderKind::Auto => {
+            let mut last = String::new();
             for hardware in [true, false] {
                 match windows::MfH264Encoder::new(config, hardware, None) {
                     Ok(enc) => return Ok(Box::new(enc)),
                     Err(err) => {
                         tracing::debug!(hardware, %err, "Media Foundation encoder unavailable");
+                        last = err.to_string();
                     }
                 }
             }
-            Ok(Box::new(OpenH264Encoder::new(config)?))
+            if cfg!(feature = "openh264") {
+                return openh264(config);
+            }
+            Err(CodecError::Unavailable(format!(
+                "no Media Foundation H.264 encoder ({last}). On Windows N editions, install the \
+                 Media Feature Pack (Settings > Apps > Optional features)"
+            )))
         }
         #[cfg(not(windows))]
-        EncoderKind::Auto => Ok(Box::new(OpenH264Encoder::new(config)?)),
+        EncoderKind::Auto => openh264(config),
         #[cfg(not(windows))]
         EncoderKind::MediaFoundationHardware | EncoderKind::MediaFoundationSoftware => Err(
             CodecError::Unavailable("Media Foundation is only available on Windows".into()),

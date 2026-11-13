@@ -27,7 +27,7 @@ See [docs/PLAN.md](docs/PLAN.md) for architecture, decisions and milestones.
 | `crates/peet-capture` | Screen capture: DXGI Desktop Duplication with GDI fallback (Windows). |
 | `crates/peet-transport` | QUIC (quinn) endpoints, self-signed TLS, tagged framed streams. |
 | `crates/peet-core` | Client core: connect, handshake, control, video events, screenshots. Shared by viewer, CLI and (later) MCP. |
-| `crates/peet-codec` | H.264 encode (Media Foundation hardware/software, openh264 fallback) and decode (Media Foundation + DXVA), GPU colour conversion. |
+| `crates/peet-codec` | H.264 encode (Media Foundation hardware/software; openh264 behind an off-by-default feature for benchmarks) and decode (Media Foundation + DXVA), GPU colour conversion. |
 | `crates/peet-control` | Local control API of a running host: JSON lines over the `\\.\pipe\peetconnect-host` named pipe (status, sessions, notices; disconnect, pause, shutdown). |
 | `crates/peet-input` | Synthesises mouse and keyboard input with `SendInput`; layout-independent key table. |
 | `bins/peet` | Command line, and the `mcp` subcommand: an MCP server exposing hosts as agent tools. |

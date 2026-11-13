@@ -16,7 +16,7 @@ tracing-subscriber.workspace = true
 # Windows-only: the binary is a stub elsewhere and these would be dead weight.
 [target.'cfg(windows)'.dependencies]
 peet-capture.workspace = true
-peet-codec.workspace = true
+peet-codec = { workspace = true, features = ["openh264"] }
 windows.workspace = true
 
 [lints]

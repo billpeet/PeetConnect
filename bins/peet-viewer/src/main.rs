@@ -10,7 +10,6 @@
 //! `%LOCALAPPDATA%\PeetConnect\viewer.log`.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
-
 // On other platforms the binary is a stub, so nothing below main is reachable.
 #![cfg_attr(not(windows), allow(dead_code))]
 

@@ -21,3 +21,8 @@ First packaged release.
 - Tray app: status icon, connected viewers with disconnect, pause new connections,
   connect/disconnect notifications, start with Windows.
 - `peet` command line and MCP server so agents can see and drive a host without a window.
+
+### Requirements
+
+- Windows 10 1809 or later, x64, with Tailscale. Windows N editions need the Media Feature Pack
+  (Settings > Apps > Optional features) for H.264 encoding and decoding.

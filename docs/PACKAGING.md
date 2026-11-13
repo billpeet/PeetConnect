@@ -202,12 +202,13 @@ is an OV certificate with cloud signing (SSL.com eSigner or Certum), roughly A$3
 
 ## Risks and open questions
 
-- **openh264 is compiled from source** (the `openh264` crate's default `source` feature). Cisco's
-  free H.264 patent licence covers only Cisco's own prebuilt binary, so publicly distributed copies
-  should not include a compiled-from-source encoder. Options are the crate's `libloading` feature,
-  which downloads Cisco's DLL on first use and verifies its hash, or dropping the software
-  fallback from release builds and relying on Media Foundation, which Windows licenses. This must
-  be decided before the first public release.
+- **H.264 licensing (decided 2026-11-13):** releases use only Media Foundation encoders and
+  decoders, licensed with Windows and the GPU drivers. openh264, compiled from source and so not
+  covered by Cisco's patent licence (which covers only Cisco's prebuilt binary), is behind the
+  off-by-default `peet-codec` feature `openh264`, which only `peet-bench` enables. The host never
+  used it (it creates Media Foundation encoders directly), so earlier builds did not contain it
+  either. Windows N editions need the Media Feature Pack, as the host's error says. A future
+  Linux host would load Cisco's DLL at runtime (`openh264` crate `libloading`) under their terms.
 - **Antivirus:** remote-access tools are often flagged as potentially unwanted ("RemoteAdmin"),
   and unsigned ones more so. Submit each release to Microsoft's false-positive portal until
   signing is in place.

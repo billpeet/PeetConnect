@@ -1,14 +1,21 @@
 [package]
 name = "peet-codec"
-description = "Video encoders: Media Foundation H.264 (hardware/software) and openh264 fallback"
+description = "Video encoders: Media Foundation H.264 (hardware/software), optional openh264"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# Cisco openh264 compiled from source. Off by default and out of release builds: Cisco's free
+# H.264 patent licence covers only its own prebuilt binary, and on Windows Media Foundation's
+# software encoder (licensed with Windows) is always tried first anyway. peet-bench enables it
+# for comparisons. See docs/PACKAGING.md.
+[features]
+openh264 = ["dep:openh264"]
+
 [dependencies]
-openh264.workspace = true
+openh264 = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 

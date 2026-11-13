@@ -165,7 +165,12 @@ impl Worker {
             Ok(enc) if enc.accepts_textures() => enc,
             Ok(_) | Err(_) => {
                 tracing::warn!(monitor = %self.monitor.name, "no hardware encoder; using software MFT");
-                MfH264Encoder::new(&enc_config, false, d3d).context("creating software encoder")?
+                // Microsoft's software MFT ships with every Windows edition except N, where
+                // Media Foundation itself is an optional feature.
+                MfH264Encoder::new(&enc_config, false, d3d).context(
+                    "no H.264 encoder available (on Windows N editions, install the Media \
+                     Feature Pack: Settings > Apps > Optional features)",
+                )?
             }
         };
         tracing::info!(
