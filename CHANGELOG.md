@@ -5,6 +5,8 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.2.1 - 2026-11-13
+
 ### Added
 
 - Automatic updates. Installed copies check GitHub for a newer signed release, download it in
