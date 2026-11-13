@@ -322,6 +322,16 @@ before Restart Manager looked, relaunched, removed Run value not restored), unin
 key, shortcuts, Run value and PATH exactly restored, `host.toml` kept). Not verified: the
 interactive wizard pages and the per-machine mode with the service (no administrator).
 
+*Work item 4 (2026-11-13)* — `release.yml` (tag `v*` → check tag, Inno Setup, `xtask dist`,
+installer smoke test, signed manifest, provenance attestation, draft release; pre-release versions
+marked prerelease). `cargo xtask release <version>` (version, lock file, CHANGELOG, commit, tag),
+`manifest` (`latest.json` + ed25519 `latest.json.sig` + `SHA256SUMS`, checked against the committed
+`packaging/update-key.pub`), `keygen` (will not replace an existing public key), `check-tag`,
+`notes`. Update key generated 2026-11-13; private key kept outside the repository. Verified
+locally: manifest signed and verified with the real key, a wrong key rejected, the release command
+dry-run in a throwaway worktree (commit, tag, version, lock file, CHANGELOG, notes; older version
+refused). Not yet run on GitHub.
+
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.
 
