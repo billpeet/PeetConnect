@@ -29,11 +29,13 @@ pub fn capture_window(
     adapter_index: u32,
     codec: Codec,
     max_width: Option<u32>,
+    popups: bool,
 ) -> Result<EncodedImage, String> {
     let device =
         peet_capture::windows::D3dDevice::for_adapter(adapter_index).map_err(|e| e.to_string())?;
     let options = WgcOptions {
         min_interval: None,
+        include_secondary_windows: popups,
         ..WgcOptions::default()
     };
     let mut cap =

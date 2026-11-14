@@ -48,6 +48,8 @@ pub struct StreamParams {
     /// Follow the active input desktop (service worker mode) so capture survives a desktop
     /// switch to the secure desktop.
     pub follow_desktop: bool,
+    /// Window streams include the window's popups (`IncludeSecondaryWindows`).
+    pub window_popups: bool,
 }
 
 /// What a stream captures.
@@ -431,6 +433,7 @@ impl Worker {
     ) -> Result<Capture, CaptureError> {
         let options = WgcOptions {
             min_interval: Some(Duration::from_secs(1) / self.params.fps.max(1)),
+            include_secondary_windows: self.params.window_popups,
             ..WgcOptions::default()
         };
         Ok(Capture::Window(WgcCapturer::new(

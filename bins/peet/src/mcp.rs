@@ -183,6 +183,17 @@ fn tool_list() -> Vec<Value> {
             } },
         }),
         json!({
+            "name": "peet_resize_window",
+            "description": "Resize a host window's visible area to WIDTH x HEIGHT physical pixels, keeping its top-left corner. A maximised window is restored first; a minimised one is left alone (focus it first).",
+            "inputSchema": { "type": "object", "required": ["host", "window", "width", "height"], "properties": {
+                "host": host_prop(),
+                "window": { "type": "string", "description": "Window id (decimal or 0x hex) or a unique title substring" },
+                "width": { "type": "integer", "minimum": 64 },
+                "height": { "type": "integer", "minimum": 64 },
+                "pin": { "type": "string" }
+            } },
+        }),
+        json!({
             "name": "peet_screenshot",
             "description": "Capture a host monitor, or one window, as a PNG image. Returns the image. A window is captured even when other windows cover it, but not while minimised.",
             "inputSchema": { "type": "object", "required": ["host"], "properties": {
@@ -266,6 +277,7 @@ async fn call_tool(
         "peet_monitors" => tool_monitors(args, sessions).await,
         "peet_windows" => tool_windows(args, sessions).await,
         "peet_focus_window" => tool_focus_window(args, sessions).await,
+        "peet_resize_window" => tool_resize_window(args, sessions).await,
         "peet_screenshot" => tool_screenshot(args, sessions).await,
         "peet_move" => tool_move(args, sessions).await,
         "peet_click" => tool_click(args, sessions).await,
@@ -340,6 +352,38 @@ async fn tool_focus_window(args: &Value, sessions: &Arc<Sessions>) -> Result<Vec
     .await?;
     Ok(vec![text_content(&format!(
         "focused {:#x} {}",
+        target.id.0, target.title
+    ))])
+}
+
+async fn tool_resize_window(args: &Value, sessions: &Arc<Sessions>) -> Result<Vec<Value>> {
+    let spec = arg_str(args, "window")
+        .context("window is required")?
+        .to_owned();
+    let width = arg_u32(args, "width").context("width is required")?;
+    let height = arg_u32(args, "height").context("height is required")?;
+    let slot = sessions.acquire(args)?;
+    let windows = run(&slot, |control, info| async move {
+        require_windows(&info)?;
+        control.list_windows(WINDOWS_TIMEOUT).await
+    })
+    .await?;
+    let target = crate::pick_window(windows, &spec)?;
+    if target.minimized {
+        return Err(anyhow!(
+            "window {:#x} is minimised; focus it first",
+            target.id.0
+        ));
+    }
+    let id = target.id;
+    run(&slot, |control, _| async move {
+        control.resize_window(id, width, height).await?;
+        tokio::time::sleep(INPUT_GRACE).await;
+        Ok(())
+    })
+    .await?;
+    Ok(vec![text_content(&format!(
+        "resized {:#x} {} to {width}x{height}",
         target.id.0, target.title
     ))])
 }

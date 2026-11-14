@@ -82,6 +82,12 @@ pub struct VideoConfig {
     /// crawls. Default true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wake_display: Option<bool>,
+    /// Window streams and screenshots also show the window's popups (menus, tooltips,
+    /// dropdowns). WGC does this by compositing in every top-level window of the same process
+    /// that overlaps it, so another window of the same app can show through too. Windows 11
+    /// 24H2 and later. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_popups: Option<bool>,
 }
 
 impl FileConfig {
@@ -104,6 +110,7 @@ impl FileConfig {
                 max_bitrate_kbps: cli.bitrate_kbps,
                 capture: cli.capture.clone(),
                 wake_display: None,
+                window_popups: None,
             },
         }
     }
@@ -132,6 +139,8 @@ const TEMPLATE_HEADER: &str = "\
 # fps = 60
 # max_bitrate_kbps = 12000
 # capture = \"auto\"        # auto | dxgi | wgc | gdi
+# wake_display = true     # wake the displays and keep them on while a viewer is connected
+# window_popups = true    # window streams include the app's menus and other popups
 ";
 
 /// The default file: per-user for a console host, machine-wide for the service and its worker.
@@ -178,6 +187,8 @@ pub struct HostConfig {
     pub capture: String,
     /// See [`VideoConfig::wake_display`].
     pub wake_display: bool,
+    /// See [`VideoConfig::window_popups`].
+    pub window_popups: bool,
     /// True when running as the service worker: capture and input threads follow the active
     /// input desktop so they keep working across the secure desktop.
     pub follow_desktop: bool,
@@ -217,6 +228,7 @@ impl HostConfig {
                 .or(file.video.capture)
                 .unwrap_or_else(|| "auto".into()),
             wake_display: file.video.wake_display.unwrap_or(true),
+            window_popups: file.video.window_popups.unwrap_or(true),
             follow_desktop: cli.session_worker,
         }
     }

@@ -1435,6 +1435,8 @@ mod app {
                 .px_2()
                 .py(px(2.0))
                 .rounded_md()
+                .flex_none()
+                .whitespace_nowrap()
                 .bg(rgb(bg))
                 .text_color(rgb(fg))
                 .cursor_pointer()
@@ -1796,7 +1798,15 @@ mod app {
                 .gap_1()
                 .text_sm()
                 .bg(rgb(0x101010))
-                .child(div().flex_1().child(self.status.clone()));
+                // The status gives way to the chips: a viewer fitted to a narrow window must
+                // still reach them.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(self.status.clone()),
+                );
             if let Some(s) = &session_status {
                 let on_monitors = s.window.is_none();
                 if s.connected && s.monitors.len() > 1 {
@@ -1827,13 +1837,11 @@ mod app {
                     ));
                 }
                 if s.connected && s.windows_supported {
-                    let label = match &s.window {
-                        Some(w) => format!("window: {} ▾", short_title(&w.title, 24)),
-                        None => "window ▾".into(),
-                    };
+                    // No title here: the status and the viewer's own title already show it,
+                    // and the bar has to fit a viewer fitted to a narrow window.
                     bar = bar.child(Self::chip(
                         ("mon", 97),
-                        label,
+                        "window ▾".into(),
                         !on_monitors || self.picker_open,
                         cx.listener(|this, _, _, _| this.toggle_picker()),
                     ));

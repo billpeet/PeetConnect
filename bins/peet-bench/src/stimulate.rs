@@ -4,6 +4,8 @@
 //! cycling background at roughly 60 Hz. The windows close when the [`Stimulator`] drops.
 //! [`occluder`] opens a plain grey window on top, to test capture of covered windows, and
 //! [`test_window`] an ordinary titled, resizable animated window for single-window streams.
+//! The windows print the clicks and characters they receive to stderr, so a test can check
+//! that remote input arrived.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, OnceLock};
@@ -20,8 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetMessageW, GetWindowLongPtrW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursorPos,
     SetTimer, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, GWLP_USERDATA, MSG, WINDOW_EX_STYLE,
-    WM_CLOSE, WM_DESTROY, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +225,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_PAINT => {
                 paint(hwnd);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                // Client coordinates, signed 16-bit each.
+                let (x, y) = (lparam.0 as i16, (lparam.0 >> 16) as i16);
+                eprintln!("test window: click at {x},{y}");
+                LRESULT(0)
+            }
+            WM_CHAR => {
+                let ch = u32::try_from(wparam.0).ok().and_then(char::from_u32);
+                eprintln!("test window: char {ch:?}");
                 LRESULT(0)
             }
             WM_DESTROY => {

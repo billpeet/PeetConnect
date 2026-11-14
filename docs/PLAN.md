@@ -339,7 +339,8 @@ with the installer, zip, `latest.json(.sig)` and `SHA256SUMS`; the installer's h
 matched the manifest. Decided the same day: openh264 stays out of release builds (see "Known hard
 parts").
 
-**M8 — Single-window streaming.** (planned) Stream one host window instead of a whole monitor,
+**M8 — Single-window streaming. Done 2026-11-14,** except testing under the SYSTEM service
+(see the follow-ups after item 6). Stream one host window instead of a whole monitor,
 so a remote app (an editor, T3 Code) can be watched and driven as if it ran locally. Researched
 2026-11-13.
 
@@ -463,8 +464,8 @@ window belongs to the same process, so an open menu or dialog is not dismissed. 
 title mirrors the remote window's title. `peet-viewer --window <id|title>` opens straight onto a
 window, and reconnects return to the shown window. Verified with `peet-bench testwindow` and
 `--window`: the stream showed, a move and a resize were followed, the minimised card appeared and
-cleared on restore, and the closed card appeared. Not yet exercised by hand: clicking through
-the picker, and input into a window stream.
+cleared on restore, and the closed card appeared. The picker and input were exercised on
+2026-11-14 (see the follow-ups after item 6).
 
 *Frame rate (2026-11-14)*: the host once sent only 1–5 fps of the animated test window, against
 ~26 fps earlier. Neither covering the window nor the debug build was the cause. The whole
@@ -505,6 +506,38 @@ Verified on a 150% display with `peet-bench testwindow --hold`:
 - Resizing the host window to 1632x1131 made the viewer follow.
 - Shrinking the viewer to a 1182x906 area resized the host window to 1183x906, which then held
   still.
+
+*Follow-ups (2026-11-14)*:
+- **MCP:** `peet_resize_window { host, window, width, height }`, like `peet resize`. It refuses
+  a minimised window up front, since the host would only log the refusal.
+- **Popups setting:** `[video] window_popups` (default true) sets `IncludeSecondaryWindows` for
+  window streams and window screenshots. Turn it off when another window of the same app keeps
+  showing through (finding 2 of item 1). The setting is host-wide; per-stream control would need
+  a protocol change and nothing asks for it yet.
+- **Test window input log:** `peet-bench testwindow` prints the clicks and characters it
+  receives to stderr, so a test can check that remote input arrived.
+- **Bar fix:** a viewer fitted to a narrow window pushed every chip off the bar, because the
+  status text would not shrink. The status now truncates, chips keep their size, and the window
+  chip reads "window ▾" (the title is already in the status and the viewer's title bar). All
+  chips fit at 782 px wide on a 150% display.
+
+Exercised by hand against a loopback test host, driving the viewer with posted mouse, wheel and
+key messages:
+- The "window ▾" chip opened the picker over a monitor stream.
+- The list scrolled, the hover highlight followed the pointer, and clicking "PeetConnect test
+  window" switched to it at 41 fps, with the viewer fitted to 782x590 plus the bar.
+- A click in the video reached the test window at client (397, 255), which matches the mapping
+  (bar, title bar and border subtracted).
+- Typed "h" and "i" arrived as characters, after `FocusWindow` brought the window forward.
+- `peet_resize_window` resized the window to exactly 900x600.
+- With `window_popups = false`, window screenshots still worked.
+
+Still open:
+- **WGC from the SYSTEM service worker.** Untested, because it needs an elevated install. The
+  worker keeps `AutoNoWgc` for monitors. Window streams there use WGC regardless and may fail.
+- **The picker lists the viewer itself** when host and viewer share a machine. Picking it gives
+  a hall of mirrors. This only happens in loopback testing, so it is left alone.
+- **Compatibility:** v0.2.0 peers cannot talk to this build, so host and viewer ship together.
 
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.

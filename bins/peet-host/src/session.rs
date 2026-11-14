@@ -251,6 +251,7 @@ async fn control_loop(
                             bitrate_kbps: max_bitrate_kbps.map_or(state.config.max_bitrate_kbps, |b| b.min(state.config.max_bitrate_kbps)).max(200),
                             backend: parse_backend(&state.config.capture),
                             follow_desktop: state.config.follow_desktop,
+                            window_popups: state.config.window_popups,
                         };
                         if streams.get(&source).is_some_and(|s| s.params.fps == params.fps && s.params.bitrate_kbps == params.bitrate_kbps) {
                             streams[&source].request_keyframe();
@@ -304,9 +305,10 @@ async fn control_loop(
                         };
                         let adapter = monitors.first().map_or(0, |m| m.adapter_index);
                         let tx = ctl_tx.clone();
+                        let popups = state.config.window_popups;
                         tokio::task::spawn_blocking(move || {
                             let result = match (request.source, monitor) {
-                                (SourceId::Window(w), _) => crate::screenshot::capture_window(w.0, adapter, request.codec, request.max_width),
+                                (SourceId::Window(w), _) => crate::screenshot::capture_window(w.0, adapter, request.codec, request.max_width, popups),
                                 (_, Some(desc)) => crate::screenshot::capture(&desc, request.codec, request.max_width),
                                 (source, None) => Err(format!("{source} not found")),
                             };
