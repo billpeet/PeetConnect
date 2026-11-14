@@ -154,6 +154,8 @@ mod clipboard;
 #[cfg(windows)]
 mod control;
 #[cfg(windows)]
+mod crop;
+#[cfg(windows)]
 mod desktop;
 #[cfg(windows)]
 mod display;

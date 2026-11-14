@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use peet_capture::windows::{
-    describe_window, enumerate_monitors, enumerate_windows, wgc_supported, Backend,
-};
+use peet_capture::windows::{describe_window, enumerate_monitors, enumerate_windows, Backend};
 use peet_capture::{MonitorDesc, WindowDesc};
 use peet_proto::{
     Capabilities, ClientHello, Codec, ControlMessage, Feature, InputEvent, RejectReason,
@@ -136,11 +134,13 @@ async fn handshake(state: &HostState, connection: &quinn::Connection) -> Result<
         capabilities: Capabilities {
             codecs: vec![Codec::H264],
             features: {
-                let mut features = vec![Feature::Screenshot, Feature::Clipboard];
-                if wgc_supported() {
-                    features.push(Feature::WindowCapture);
-                }
-                features
+                // Without WGC (as SYSTEM) windows are cut out of the monitor capture, so
+                // window capture is always available.
+                vec![
+                    Feature::Screenshot,
+                    Feature::Clipboard,
+                    Feature::WindowCapture,
+                ]
             },
         },
         monitors: monitors.iter().map(MonitorDesc::to_proto).collect(),
@@ -252,6 +252,7 @@ async fn control_loop(
                             backend: parse_backend(&state.config.capture),
                             follow_desktop: state.config.follow_desktop,
                             window_popups: state.config.window_popups,
+                            window_crop: state.config.window_crop,
                         };
                         if streams.get(&source).is_some_and(|s| s.params.fps == params.fps && s.params.bitrate_kbps == params.bitrate_kbps) {
                             streams[&source].request_keyframe();
@@ -306,9 +307,10 @@ async fn control_loop(
                         let adapter = monitors.first().map_or(0, |m| m.adapter_index);
                         let tx = ctl_tx.clone();
                         let popups = state.config.window_popups;
+                        let crop = state.config.window_crop;
                         tokio::task::spawn_blocking(move || {
                             let result = match (request.source, monitor) {
-                                (SourceId::Window(w), _) => crate::screenshot::capture_window(w.0, adapter, request.codec, request.max_width, popups),
+                                (SourceId::Window(w), _) => crate::screenshot::capture_window(w.0, adapter, request.codec, request.max_width, popups, crop),
                                 (_, Some(desc)) => crate::screenshot::capture(&desc, request.codec, request.max_width),
                                 (source, None) => Err(format!("{source} not found")),
                             };

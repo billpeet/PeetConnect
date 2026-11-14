@@ -2,7 +2,8 @@
 //!
 //! Monitors use GDI so it works even when Desktop Duplication is unavailable, and because a
 //! still does not need the GPU path. Windows use Windows.Graphics.Capture, which sees a window
-//! even when others cover it. Runs on a blocking thread.
+//! even when others cover it; where WGC is unavailable (the SYSTEM service) the window is cut
+//! out of a GDI capture of its monitor. Runs on a blocking thread.
 
 use std::time::Duration;
 
@@ -30,7 +31,12 @@ pub fn capture_window(
     codec: Codec,
     max_width: Option<u32>,
     popups: bool,
+    crop: bool,
 ) -> Result<EncodedImage, String> {
+    if crop || !crate::crop::wgc_usable() {
+        let (bgra, width, height) = crate::crop::still(id)?;
+        return encode(bgra, width, height, codec, max_width);
+    }
     let device =
         peet_capture::windows::D3dDevice::for_adapter(adapter_index).map_err(|e| e.to_string())?;
     let options = WgcOptions {

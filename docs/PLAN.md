@@ -339,8 +339,7 @@ with the installer, zip, `latest.json(.sig)` and `SHA256SUMS`; the installer's h
 matched the manifest. Decided the same day: openh264 stays out of release builds (see "Known hard
 parts").
 
-**M8 — Single-window streaming. Done 2026-11-14,** except testing under the SYSTEM service
-(see the follow-ups after item 6). Stream one host window instead of a whole monitor,
+**M8 — Single-window streaming. Done 2026-11-14.** Stream one host window instead of a whole monitor,
 so a remote app (an editor, T3 Code) can be watched and driven as if it ran locally. Researched
 2026-11-13.
 
@@ -361,8 +360,8 @@ the window's popups, older builds miss them. Windows excluded from capture
 unavailable. Input still goes through `SendInput` in desktop coordinates, so the window must be
 in front to receive it: watching works when covered, and the first input to a window stream
 brings it to the foreground. Posting input messages straight to the `HWND` is rejected (Chromium
-and Electron ignore much of it). Whether WGC works from the SYSTEM service worker is unknown;
-the `--console` host is the tested path.
+and Electron ignore much of it). WGC does not work from the SYSTEM service worker, so window
+streams there are cut out of the monitor capture instead (see "WGC as SYSTEM" after item 6).
 
 *Work items.*
 1. WGC spike in `peet-capture` and `peet-bench`: `Backend::Wgc` for monitors, window
@@ -532,9 +531,51 @@ key messages:
 - `peet_resize_window` resized the window to exactly 900x600.
 - With `window_popups = false`, window screenshots still worked.
 
+*WGC as SYSTEM (2026-11-14)*: tested without installing the service. An elevated script
+started processes with a copy of `winlogon.exe`'s token, which is SYSTEM in the console session
+on `winsta0\default`. That is how the worker runs when it falls back to the service's own token.
+- **WGC is unavailable there.** `GraphicsCaptureSession::IsSupported()` returns false, so WGC
+  cannot be used at all, for windows or monitors. Desktop Duplication works: a monitor stream
+  ran at 44 fps.
+- **Fallback, `peet-host/src/crop.rs`:** where WGC is unavailable, a window stream captures the
+  monitor under the window's centre and copies out the window's visible rectangle each frame.
+  - A move is followed in place.
+  - A resize on the same monitor makes a new cut-out texture but keeps the monitor capture.
+  - Moving to another monitor rebuilds on that monitor, recreating the device if it is on
+    another adapter.
+  - Minimised windows deliver no frames and closing is reported, as with WGC.
+  - Window screenshots cut the window out of a GDI capture of its monitor.
+  - `Feature::WindowCapture` is now always advertised.
+  - The cost: the stream shows the screen, so whatever covers the window is in the picture.
+    Input brings the window to the front.
+- **One duplication per output:** DXGI lets a process duplicate each output only once (a
+  second `DuplicateOutput` returns E_INVALIDARG). A cut-out window and a monitor stream of the
+  same monitor, or two cut-out windows on it, would collide. Whichever starts second falls back
+  to GDI: about 15–19 fps at 4K, against 40 for DXGI. Sharing one duplication per output
+  between streams would remove that cost, if it matters.
+- **Config:** `[video] window_capture = "crop"` forces the cut-out even where WGC works, for
+  testing or when WGC misbehaves.
+- **Verified:**
+  - As the user with `window_capture = "crop"`:
+    - stream at 44 fps, with a move followed;
+    - the test window's move, resize (rebuilt at 982x692), minimise, restore and close
+      sequence;
+    - a jump to DISPLAY2, rebuilt there at 38–40 fps;
+    - the screenshot;
+    - concurrent monitor and window streams (the second one on GDI).
+  - As SYSTEM with no configuration: the window listed, screenshotted (782x591) and streamed
+    at 40–46 fps.
+- **Seen but not fixed:**
+  - A client running as the user could not reach the SYSTEM worker over loopback (connection
+    timed out). A client running as SYSTEM could. Remote viewers arrive over the tailnet
+    interface instead, so this only affects local testing.
+  - `spawn_worker` in `service.rs` prefers the console user's token (`WTSQueryUserToken`) and
+    uses the SYSTEM token only when nobody is logged on, although the module doc says the
+    worker runs as SYSTEM to reach the secure desktop. As the user, WGC works but the secure
+    desktop is out of reach. That decision belongs with the untested service work (M4), not
+    M8. Window streams work under either token now.
+
 Still open:
-- **WGC from the SYSTEM service worker.** Untested, because it needs an elevated install. The
-  worker keeps `AutoNoWgc` for monitors. Window streams there use WGC regardless and may fail.
 - **The picker lists the viewer itself** when host and viewer share a machine. Picking it gives
   a hall of mirrors. This only happens in loopback testing, so it is left alone.
 - **Compatibility:** v0.2.0 peers cannot talk to this build, so host and viewer ship together.

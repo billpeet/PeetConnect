@@ -7,9 +7,11 @@
 //! encoded frame, which would break the reference chain) and the rate controller lowers the
 //! bitrate. When the queue has been empty for a while the bitrate creeps back up.
 //!
-//! Window streams use Windows.Graphics.Capture. The thread also watches the window: it reports
-//! moves, minimise and restore to the viewer, rebuilds capture and encoder at the new size once
-//! a resize settles, and ends the stream when the window closes.
+//! Window streams use Windows.Graphics.Capture, or, where that is unavailable (the SYSTEM
+//! service worker), the window's rectangle cut out of its monitor's capture (see
+//! [`crate::crop`]). The thread also watches the window: it reports moves, minimise and restore
+//! to the viewer, rebuilds capture and encoder at the new size once a resize settles (or the
+//! window moves to another monitor, for a cut-out), and ends the stream when the window closes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,10 +20,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use peet_capture::windows::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use peet_capture::windows::{
-    describe_window, enumerate_monitors, Backend, D3dDevice, FrameSource, WgcCapturer, WgcOptions,
-    WgcTarget,
+    describe_window, Backend, D3dDevice, FrameSource, WgcCapturer, WgcOptions, WgcTarget,
 };
 use peet_capture::{CaptureError, CursorState, FrameMeta, MonitorDesc};
+
+use crate::crop::CropCapture;
 use peet_codec::windows::MfH264Encoder;
 use peet_codec::{EncoderConfig, VideoEncoder};
 use peet_proto::{
@@ -50,6 +53,8 @@ pub struct StreamParams {
     pub follow_desktop: bool,
     /// Window streams include the window's popups (`IncludeSecondaryWindows`).
     pub window_popups: bool,
+    /// Cut window streams out of the monitor capture even when WGC is available.
+    pub window_crop: bool,
 }
 
 /// What a stream captures.
@@ -174,6 +179,7 @@ async fn sender(
 enum Capture {
     Monitor(FrameSource),
     Window(WgcCapturer),
+    Cropped(CropCapture),
 }
 
 impl Capture {
@@ -181,6 +187,7 @@ impl Capture {
         match self {
             Capture::Monitor(s) => s.name(),
             Capture::Window(_) => "wgc-window",
+            Capture::Cropped(c) => c.name(),
         }
     }
 
@@ -188,12 +195,30 @@ impl Capture {
         match self {
             Capture::Monitor(s) => s.size(),
             Capture::Window(c) => c.size(),
+            Capture::Cropped(c) => c.size(),
         }
     }
 
+    /// The window's current size, which the encoded size follows once it settles.
+    fn content_size(&self) -> (u32, u32) {
+        match self {
+            Capture::Monitor(s) => s.size(),
+            Capture::Window(c) => c.content_size(),
+            Capture::Cropped(c) => c.content_size(),
+        }
+    }
+
+    /// True when the capture must be rebuilt right away: a cut-out window moved to another
+    /// monitor.
+    fn stale(&self) -> bool {
+        matches!(self, Capture::Cropped(c) if c.left_monitor())
+    }
+
     fn wait_for_slot(&mut self) {
-        if let Capture::Monitor(s) = self {
-            s.wait_for_slot();
+        match self {
+            Capture::Monitor(s) => s.wait_for_slot(),
+            Capture::Cropped(c) => c.wait_for_slot(),
+            Capture::Window(_) => {}
         }
     }
 
@@ -201,6 +226,7 @@ impl Capture {
         match self {
             Capture::Monitor(s) => s.acquire(timeout),
             Capture::Window(c) => c.acquire(timeout),
+            Capture::Cropped(c) => c.acquire(timeout),
         }
     }
 
@@ -208,6 +234,7 @@ impl Capture {
         match self {
             Capture::Monitor(s) => s.texture(),
             Capture::Window(c) => c.texture(),
+            Capture::Cropped(c) => c.texture(),
         }
     }
 }
@@ -242,14 +269,33 @@ impl Worker {
             .then(crate::desktop::attach_input_desktop)
             .flatten();
         let id = self.source.id();
-        let (device, mut capture, mut watch) = match &self.source {
+        let (mut device, mut capture, mut watch) = match &self.source {
             Source::Monitor(monitor) => {
                 let device = D3dDevice::for_adapter(monitor.adapter_index)?;
                 let backend = match self.params.backend {
                     Backend::Auto if self.params.follow_desktop => Backend::AutoNoWgc,
                     other => other,
                 };
-                let source = FrameSource::new(device.clone(), monitor, backend, self.params.fps)?;
+                // DXGI lets a process duplicate each output once, so this fails while a
+                // window cut out of this monitor is streaming (see `crate::crop`). GDI has no
+                // such limit.
+                let source =
+                    match FrameSource::new(device.clone(), monitor, backend, self.params.fps) {
+                        Ok(source) => source,
+                        Err(err) if backend != Backend::Gdi => {
+                            tracing::info!(
+                                monitor = %monitor.name, %err,
+                                "monitor capture busy or unavailable; using GDI"
+                            );
+                            FrameSource::new(
+                                device.clone(),
+                                monitor,
+                                Backend::Gdi,
+                                self.params.fps,
+                            )?
+                        }
+                        Err(err) => return Err(err.into()),
+                    };
                 (device, Capture::Monitor(source), None)
             }
             Source::Window(window) => {
@@ -297,18 +343,29 @@ impl Worker {
         // texture instead of waiting for the next change.
         let mut have_frame = false;
         while !self.stop.load(Ordering::Relaxed) {
-            if let (Some(w), Capture::Window(cap)) = (&mut watch, &capture) {
-                if self.poll_window(w, cap.content_size(), (width, height)) {
-                    // The resize settled: rebuild at the new size. The new encoder starts
-                    // with an IDR frame at the new dimensions.
-                    capture = match self.window_capture(&device, w.id) {
-                        Ok(c) => c,
+            if let Some(w) = &mut watch {
+                let settled = self.poll_window(w, capture.content_size(), (width, height));
+                if settled || capture.stale() {
+                    // The resize settled (or a cut-out changed monitor): rebuild at the new
+                    // size. The new encoder starts with an IDR frame at the new dimensions.
+                    let adapter = adapter_for(w.bounds);
+                    if adapter != device.adapter_index {
+                        device = D3dDevice::for_adapter(adapter)?;
+                    }
+                    let rebuilt = match &mut capture {
+                        // Same monitor: keep the monitor capture, new cut-out size.
+                        Capture::Cropped(c) if !c.left_monitor() => c.resize().map(|()| None),
+                        _ => self.window_capture(&device, w.id).map(Some),
+                    };
+                    match rebuilt {
+                        Ok(Some(c)) => capture = c,
+                        Ok(None) => {}
                         Err(CaptureError::Closed) => {
                             self.window_changed(w.id, WindowChange::Closed);
                             break;
                         }
                         Err(err) => return Err(err).context("restarting window capture"),
-                    };
+                    }
                     (width, height) = capture.size();
                     encoder = self.encoder(&device, width, height)?;
                     encoder.request_keyframe();
@@ -426,21 +483,35 @@ impl Worker {
         }
     }
 
+    /// WGC when it is available, else the window cut out of its monitor's capture.
     fn window_capture(
         &self,
         device: &D3dDevice,
         window: WindowId,
     ) -> Result<Capture, CaptureError> {
+        let crop = || {
+            CropCapture::new(device, window.0, self.params.backend, self.params.fps)
+                .map(Capture::Cropped)
+        };
+        if self.params.window_crop || !crate::crop::wgc_usable() {
+            return crop();
+        }
         let options = WgcOptions {
             min_interval: Some(Duration::from_secs(1) / self.params.fps.max(1)),
             include_secondary_windows: self.params.window_popups,
             ..WgcOptions::default()
         };
-        Ok(Capture::Window(WgcCapturer::new(
-            device.clone(),
-            WgcTarget::Window(window.0),
-            options,
-        )?))
+        match WgcCapturer::new(device.clone(), WgcTarget::Window(window.0), options) {
+            Ok(c) => Ok(Capture::Window(c)),
+            Err(CaptureError::Closed) => Err(CaptureError::Closed),
+            Err(err) => {
+                tracing::warn!(
+                    window = window.0, %err,
+                    "WGC window capture failed; cutting the window out of the monitor capture"
+                );
+                crop()
+            }
+        }
     }
 
     fn window_changed(&self, window: WindowId, change: WindowChange) {
@@ -492,22 +563,10 @@ impl Worker {
     }
 }
 
-/// The graphics adapter driving the monitor under the centre of `bounds`; adapter 0 if none.
+/// The graphics adapter driving the monitor under `bounds` (see [`crate::crop::monitor_for`]);
+/// adapter 0 if none.
 fn adapter_for(bounds: Rect) -> u32 {
-    let cx = bounds.x + i32::try_from(bounds.width / 2).unwrap_or(0);
-    let cy = bounds.y + i32::try_from(bounds.height / 2).unwrap_or(0);
-    enumerate_monitors()
-        .ok()
-        .and_then(|monitors| {
-            monitors.into_iter().find(|m| {
-                let b = m.bounds;
-                cx >= b.x
-                    && cy >= b.y
-                    && i64::from(cx) < i64::from(b.x) + i64::from(b.width)
-                    && i64::from(cy) < i64::from(b.y) + i64::from(b.height)
-            })
-        })
-        .map_or(0, |m| m.adapter_index)
+    crate::crop::monitor_for(bounds).map_or(0, |m| m.adapter_index)
 }
 
 #[derive(Default)]

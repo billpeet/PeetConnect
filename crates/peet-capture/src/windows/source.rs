@@ -22,7 +22,8 @@ pub enum Backend {
     #[default]
     Auto,
     /// DXGI first; fall back straight to GDI. For threads that follow the input desktop
-    /// (service worker): WGC is untested from the SYSTEM account and on the secure desktop.
+    /// (service worker): WGC is unavailable to the SYSTEM account (`IsSupported` is false
+    /// there, measured 2026-11-14).
     AutoNoWgc,
     Dxgi,
     /// Windows.Graphics.Capture of the whole monitor.
