@@ -17,7 +17,7 @@
 //! [video]
 //! fps = 60
 //! max_bitrate_kbps = 12000
-//! capture = "auto"   # auto | dxgi | gdi
+//! capture = "auto"   # auto | dxgi | wgc | gdi
 //!
 //! [update]
 //! automatic = true    # the service installs updates by itself (per-machine installs)
@@ -79,9 +79,25 @@ pub struct VideoConfig {
     pub fps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bitrate_kbps: Option<u32>,
-    /// `auto`, `dxgi` or `gdi`.
+    /// `auto`, `dxgi`, `wgc` or `gdi`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<String>,
+    /// Wake the displays when a viewer connects and keep them (and the machine) awake until
+    /// it leaves. Sleeping displays are composed only a few times a second, so capture
+    /// crawls. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_display: Option<bool>,
+    /// Window streams and screenshots also show the window's popups (menus, tooltips,
+    /// dropdowns). WGC does this by compositing in every top-level window of the same process
+    /// that overlaps it, so another window of the same app can show through too. Windows 11
+    /// 24H2 and later. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_popups: Option<bool>,
+    /// `auto` (default): window streams use Windows.Graphics.Capture, which sees a window even
+    /// when others cover it, falling back to cutting the window out of its monitor's capture
+    /// where WGC is unavailable (the SYSTEM service). `crop` always cuts it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_capture: Option<String>,
 }
 
 /// Updates of a per-machine install, which the service applies.
@@ -113,6 +129,9 @@ impl FileConfig {
                 fps: cli.fps,
                 max_bitrate_kbps: cli.bitrate_kbps,
                 capture: cli.capture.clone(),
+                wake_display: None,
+                window_popups: None,
+                window_capture: None,
             },
             update: UpdateConfig::default(),
         }
@@ -141,7 +160,10 @@ const TEMPLATE_HEADER: &str = "\
 # [video]
 # fps = 60
 # max_bitrate_kbps = 12000
-# capture = \"auto\"        # auto | dxgi | gdi
+# capture = \"auto\"        # auto | dxgi | wgc | gdi
+# wake_display = true     # wake the displays and keep them on while a viewer is connected
+# window_popups = true    # window streams include the app's menus and other popups
+# window_capture = \"auto\" # auto | crop (cut windows out of the monitor capture)
 #
 # [update]                # per-machine installs, updated by the service
 # automatic = true        # false: download, but wait for `peet update` to install
@@ -181,6 +203,7 @@ pub fn load(path: Option<&Path>, machine: bool) -> Result<(FileConfig, Option<Pa
 
 /// Fully resolved settings the host runs with.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent on/off settings
 pub struct HostConfig {
     pub bind: SocketAddr,
     pub name: String,
@@ -189,6 +212,12 @@ pub struct HostConfig {
     pub fps: u32,
     pub max_bitrate_kbps: u32,
     pub capture: String,
+    /// See [`VideoConfig::wake_display`].
+    pub wake_display: bool,
+    /// See [`VideoConfig::window_popups`].
+    pub window_popups: bool,
+    /// `window_capture = "crop"`: see [`VideoConfig::window_capture`].
+    pub window_crop: bool,
     /// True when running as the service worker: capture and input threads follow the active
     /// input desktop so they keep working across the secure desktop.
     pub follow_desktop: bool,
@@ -229,6 +258,9 @@ impl HostConfig {
                 .clone()
                 .or(file.video.capture)
                 .unwrap_or_else(|| "auto".into()),
+            wake_display: file.video.wake_display.unwrap_or(true),
+            window_popups: file.video.window_popups.unwrap_or(true),
+            window_crop: file.video.window_capture.as_deref() == Some("crop"),
             follow_desktop: cli.session_worker,
             auto_update: file.update.automatic.unwrap_or(true),
         }

@@ -5,6 +5,33 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-15
+
+### Added
+
+- Single-window streaming. The viewer's "window ▾" chip (or Ctrl+Alt+W) lists the host's
+  windows; pick one to stream just that window instead of a monitor. Moves are followed, a
+  minimised or closed window is shown as such, and input brings the window to the front.
+  "Match size" resizes the host window to the viewer's, or the viewer to the window.
+- `peet windows`, `peet focus`, `peet resize` and `peet screenshot --window` on the command
+  line, and the same in the MCP server (`peet_windows`, `peet_focus_window`,
+  `peet_resize_window`, `peet_screenshot` with `window`).
+- Host settings under `[video]`: `window_popups` (include the app's menus and popups, default
+  on) and `window_capture = "crop"` (cut the window out of the monitor capture).
+- The host wakes the displays and keeps them on while a viewer is connected
+  (`[video] wake_display`).
+
+### Changed
+
+- Protocol version 2. 0.3.0 cannot talk to 0.2.x, so update the host and the viewers together.
+  Installed copies update themselves, but a machine that has not updated yet cannot connect
+  until it does.
+- Windows Graphics Capture is used for monitors when Desktop Duplication is unavailable, before
+  falling back to GDI. Still frames are sent as keyframes, so a quiet screen recovers from
+  packet loss.
+- The unattended-access service streams windows by cutting them out of the monitor capture,
+  because Windows Graphics Capture does not work for the SYSTEM account.
+
 ## 0.2.1 - 2026-11-13
 
 ### Added

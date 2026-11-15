@@ -112,6 +112,10 @@ independent implementation (Python `dxcam`). GDI works, so this is machine/drive
 needs a capture watchdog that falls back to GDI (the bench already does this), and we should
 evaluate Windows.Graphics.Capture as a third backend. DXGI timings are therefore still
 unmeasured here; expect ~1 ms per frame when it works.
+*Probable cause, found 2026-11-14:* the displays had gone to sleep. After a long idle
+DWM composes only a few times a second, DXGI delivers nothing and WGC about 4 fps; a
+zero-distance mouse move brings both back to full rate. The host now wakes the displays at
+session start and keeps them on (see M8, frame rate).
 
 **M2 — Loopback viewer + GPUI spike. Done 2026-11-12.** `peet-codec` gained a Media Foundation
 H.264 decoder with DXVA output (NV12 D3D11 textures) and a general `GpuConverter`
@@ -353,6 +357,248 @@ Verified on this machine: a per-user 0.2.0 install found a locally served, reall
 real release (needs `v0.2.1`; installs of the published 0.2.0 have no updater and update by hand
 once).
 
+**M8 — Single-window streaming. Done 2026-11-14.** Stream one host window instead of a whole monitor,
+so a remote app (an editor, T3 Code) can be watched and driven as if it ran locally. Researched
+2026-11-13.
+
+*Capture choice.* Windows.Graphics.Capture (WGC) created from an `HWND`
+(`IGraphicsCaptureItemInterop::CreateForWindow`). It reads the window's DWM surface, so a window
+keeps updating while other windows cover it, and frames arrive as D3D11 textures on our device,
+so the zero-copy NV12 encode path is unchanged. Rejected: DXGI cropped to the window rectangle
+(shows whatever covers the window, and delivers nothing on the dev box), `PrintWindow` (CPU,
+slow; kept in mind for one-off screenshots), GDI `BitBlt` from the window DC (no DWM content).
+WGC monitor capture (`CreateForMonitor`) is the same code, and is the third backend M1 asked
+for, so it comes first.
+
+*Limits, accepted.* Minimised windows are not rendered by DWM: no frames until restored (offer
+a restore, or show the last frame marked "minimised"). Menus, tooltips and dropdowns are separate
+top-level windows; `GraphicsCaptureSession.IncludeSecondaryWindows` (Windows 11 24H2+) pulls in
+the window's popups, older builds miss them. Windows excluded from capture
+(`WDA_EXCLUDEFROMCAPTURE`) come out black. Cloaked windows (other virtual desktops) are listed as
+unavailable. Input still goes through `SendInput` in desktop coordinates, so the window must be
+in front to receive it: watching works when covered, and the first input to a window stream
+brings it to the foreground. Posting input messages straight to the `HWND` is rejected (Chromium
+and Electron ignore much of it). WGC does not work from the SYSTEM service worker, so window
+streams there are cut out of the monitor capture instead (see "WGC as SYSTEM" after item 6).
+
+*Work items.*
+1. WGC spike in `peet-capture` and `peet-bench`: `Backend::Wgc` for monitors, window
+   enumeration, window capture into a fixed-size texture, and bench measurements (capture time,
+   frame cadence, covered and minimised windows, border, secondary windows). Decide whether
+   `Auto` becomes DXGI → WGC → GDI.
+2. Protocol v2: a stream source (monitor or window) replaces `MonitorId` in `VideoFrame`,
+   `SetStream`, `RequestKeyframe`, `StreamStats` and `ScreenshotRequest`; `ListWindows` /
+   `Windows`; `WindowChanged` (moved or resized, minimised, closed); `Feature::WindowCapture`.
+3. Host: streams keyed by source; on resize, debounce then restart the encoder at the new even
+   size with a keyframe; end the stream when the window closes; bring the window forward on
+   first input; window bounds from `DWMWA_EXTENDED_FRAME_BOUNDS` (the window rectangle includes
+   invisible resize borders).
+4. CLI and MCP: `peet windows`, `peet screenshot --window <title>`.
+5. Viewer: window picker beside the monitor picker; a window is one tile in `present.rs`.
+6. Polish: size the viewer to the remote window at 1:1, mirror its title, resize the
+   remote window when the viewer is resized.
+
+*Work item 1 (2026-11-13)* — `peet-capture`: `WgcCapturer` (free-threaded frame pool,
+`FrameArrived` wakes `acquire`, newest frame copied into a fixed even-sized BGRA texture, pool
+recreated on resize with `content_size()` reporting the real size, `CaptureError::Closed` when the
+window goes), `Backend::Wgc` in `FrameSource` (host accepts `capture = "wgc"`), and
+`enumerate_windows` / `describe_window` (`WindowDesc`). `peet-bench`: `--capture wgc`, `windows`,
+and `window [--target] [--occlude] [--minimize]`, which captures the bench's own animated window
+(or a named one) through clear / covered / minimised phases; the cover is a grey topmost window
+owned by a child process, and the bench samples the centre pixel to see whether it leaked in.
+Measured on DESKTOP-ER4U7GP (RTX 4060 Ti, build 26300, NVENC, release build):
+
+| Capture | 1080p monitor | 4K monitor |
+|---|---|---|
+| WGC | 39 fps (limited by the stimulus repaint rate; same at a 240 fps cap), 9.5% of a core | 50 fps, 10.8% of a core |
+| GDI | 59.5 fps (copies every slot, changed or not), 32% of a core | 18.7 fps, 41% of a core |
+
+Findings: (1) Covered windows capture normally: cover from another process visible in 0/110
+frames, frame rate unchanged. (2) `IncludeSecondaryWindows` composites in *any* top-level window
+of the same process that overlaps, not only popups: a same-process cover was visible in 114/114
+frames with it on, 0/117 off. For a multi-window app that means its other windows can appear in
+the stream; keep it on for menus, but expose it. (3) Minimised: no frames at all. (4) Borderless
+access is granted to the unpackaged bench without a prompt; decoded frames have no yellow border.
+`IncludeSecondaryWindows` and `MinUpdateInterval` are both accepted on this build. (5) The capture
+content size equals `DWMWA_EXTENDED_FRAME_BOUNDS` exactly; `GetWindowRect` is larger by the
+invisible borders (22 px on a maximised T3 Code window). (6) An idle window delivers one frame at
+start, then nothing until it changes. The host only applies a keyframe request when a new frame
+arrives, so a viewer that joins or loses packets on a still window (or a still desktop under DXGI,
+the same latent bug) waits for the next change; the stream thread must re-encode the last texture
+on a keyframe request, and a slow refresh would help too. All `.h264` outputs decode with ffprobe
+at the expected frame counts.
+
+*Follow-up (2026-11-13)* — Keyframes on a still screen: the stream thread now re-encodes the last
+captured texture when a keyframe is requested and no new frame has arrived (and forgets the
+texture on `AccessLost`, when the source is rebuilt). Verified against a loopback test host with
+`capture = "wgc"` on two still monitors (1 frame in 3 s each): five keyframe requests per monitor
+answered in 50–110 ms. `Auto` is now DXGI → WGC → GDI, each step after 1.5 s without a frame;
+the service worker (`follow_desktop`) uses `Backend::AutoNoWgc`, the old DXGI → GDI chain, until
+WGC is tested from SYSTEM and across a secure-desktop switch. Verified by forcing DXGI silent
+(temporary patch, reverted): the bench switched to WGC after 1.5 s and ran at 44 fps. Note: DXGI
+Desktop Duplication now delivers frames on the dev box (39 fps on DISPLAY2), so `Auto` stays on
+DXGI there. The M1 open issue was probably sleeping displays; see the frame-rate note below.
+
+*Work items 2–4 (2026-11-13)* — Protocol v2 (`PROTOCOL_VERSION` 2; hellos unchanged, so a v1
+peer gets a clean `UnsupportedProtocolVersion`): `SourceId::{Monitor, Window}` in `VideoFrame`,
+`SetStream`, `RequestKeyframe`, `StreamStats`, `ScreenshotRequest`; `WindowInfo`,
+`ListWindows`/`Windows`, `WindowChanged { Bounds | Minimized | Restored | Closed }`,
+`FocusWindow`, `Feature::WindowCapture` (advertised when WGC is available). Host: `VideoStream`
+over a monitor `FrameSource` or a window `WgcCapturer`; the window thread polls position and
+state every 100 ms and reports changes, rebuilds capture and encoder 300 ms after a resize
+settles (new keyframe at the new even size), and ends the stream with `Closed`. Cursor updates
+are offset by the window's position. `FocusWindow` restores and foregrounds the window, tapping
+Alt to get past the foreground lock when needed. Window screenshots go through WGC.
+`GraphicsCaptureItem.Closed` did not fire when the test window closed, so `WgcCapturer` also
+checks `IsWindow` whenever an acquire times out. Client: `peet-core` `list_windows`,
+`focus_window`, and `set_stream`/`request_keyframe`/`screenshot` take `impl Into<SourceId>`;
+CLI `peet windows`, `peet focus <window>`, `peet screenshot --window <id|title>`; MCP
+`peet_windows`, `peet_focus_window`, `peet_screenshot { window }`. The viewer spoke v2 but
+streamed monitors only until item 5. `peet-bench testwindow` (hidden) opens a titled window that
+moves, resizes, minimises, restores and closes itself on a schedule.
+
+Verified against a loopback test host with a throwaway client probe: the test window listed,
+screenshotted (782x590, frame and title bar included, no border), streamed at ~26 fps; move
+reported as `Bounds`; resize to 1001x701 produced `Bounds`, then frames at 982x692 starting with a
+keyframe; `Minimized` (frames stop) and `Restored` (frames resume); `Closed` within ~100 ms of
+the window closing. CLI: `peet windows` listed it; `peet screenshot --window` under a grey cover
+from another process returned the window's own content; `peet focus` on the minimised window
+restored it and took the foreground from another app. MCP: tools listed, `peet_windows` returned
+16 windows, `peet_screenshot { window: "Task Manager" }` returned a PNG. Compatibility: v0.2.0
+viewers and hosts cannot talk to this build; ship host and viewer together.
+
+*Work item 5 (2026-11-13)* — viewer. The presenter lays out `View`s (a source and its desktop
+bounds) instead of monitors, so a window is one letterboxed tile and pointer mapping and the
+cursor overlay work unchanged (the host's cursor positions are desktop coordinates). The bar
+gets a "window ▾" chip (Ctrl+Alt+W) opening a list of host windows (title, process, minimised);
+picking one stops the monitor streams and starts the window's; the monitor chips, or "desktop"
+on a single-monitor host, go back. `WindowChanged` keeps the shown window's bounds current, and
+the UI maps the pointer with those bounds, since a dragged window may send no new frame. A
+minimised window gets a card with "restore" (sends `FocusWindow`); a closed one gets "show
+desktop". Both offer "pick another window". While a window is shown, any click, key or wheel
+event first sends `FocusWindow`, at most every 2 s. The host ignores it when the foreground
+window belongs to the same process, so an open menu or dialog is not dismissed. The viewer
+title mirrors the remote window's title. `peet-viewer --window <id|title>` opens straight onto a
+window, and reconnects return to the shown window. Verified with `peet-bench testwindow` and
+`--window`: the stream showed, a move and a resize were followed, the minimised card appeared and
+cleared on restore, and the closed card appeared. The picker and input were exercised on
+2026-11-14 (see the follow-ups after item 6).
+
+*Frame rate (2026-11-14)*: the host once sent only 1–5 fps of the animated test window, against
+~26 fps earlier. Neither covering the window nor the debug build was the cause. The whole
+machine was in a slow state after 13 hours idle with the displays asleep:
+- Measured: WGC 3.9 fps and DXGI 0 fps, for windows and monitors alike.
+- A zero-distance `SendInput` mouse move restored WGC to 43.9 fps and DXGI to 39.2 fps.
+- `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` does not wake displays that are already off.
+- Not reproduced on demand: turning the displays off with `SC_MONITORPOWER`, 330 s idle past
+  the 300 s display timeout, and a further hour of idle all kept capture at 37–40 fps. The slow
+  state seems to need the monitors to power down fully, which takes longer.
+
+Fix (`peet-host/src/display.rs`): each session starts with a zero-distance mouse move (input
+wakes the displays; the cursor does not move), then holds display-required and system-required
+power requests until it ends. `[video] wake_display = false` turns this off. When the displays
+were already off, the first frame came about 1 s later (1.5 s against 0.57 s from session start),
+while they powered up. The fix rests on the measured recovery after input; it has not been run
+against a reproduced slow state.
+
+*Work item 6 (2026-11-13)*:
+- **Protocol:** `ResizeWindow { window, width, height }` sets a window's visible size and keeps
+  its top-left corner. The host adds the invisible borders, restores a maximised window first,
+  refuses a minimised one and enforces at least 64 px a side. The client gets
+  `peet-core resize_window` and the CLI `peet resize <host> <window> WxH`.
+- **Viewer:** a "match size" toggle, on by default and saved in `viewer.toml` as
+  `match_window_size`.
+  - When the host window's size changes, including when it is first picked, the viewer resizes
+    itself to show it 1:1 within the local display.
+  - When the user resizes the viewer, the host window follows once the size has held for 400 ms.
+  - Video-area changes within 700 ms of the viewer's own resize are not sent, and sizes within
+    2 px count as equal (DPI rounding). So the two never chase each other, and a host window too
+    big for the local display is shown scaled down rather than shrunk.
+  - Matching is off while fullscreen or maximised.
+- **Title:** the viewer title mirrors the remote window (done in item 5).
+
+Verified on a 150% display with `peet-bench testwindow --hold`:
+- `peet resize` gave exactly 1000x700.
+- Picking the window sized the viewer's video area to 999x699, and nothing was sent back.
+- Resizing the host window to 1632x1131 made the viewer follow.
+- Shrinking the viewer to a 1182x906 area resized the host window to 1183x906, which then held
+  still.
+
+*Follow-ups (2026-11-14)*:
+- **MCP:** `peet_resize_window { host, window, width, height }`, like `peet resize`. It refuses
+  a minimised window up front, since the host would only log the refusal.
+- **Popups setting:** `[video] window_popups` (default true) sets `IncludeSecondaryWindows` for
+  window streams and window screenshots. Turn it off when another window of the same app keeps
+  showing through (finding 2 of item 1). The setting is host-wide; per-stream control would need
+  a protocol change and nothing asks for it yet.
+- **Test window input log:** `peet-bench testwindow` prints the clicks and characters it
+  receives to stderr, so a test can check that remote input arrived.
+- **Bar fix:** a viewer fitted to a narrow window pushed every chip off the bar, because the
+  status text would not shrink. The status now truncates, chips keep their size, and the window
+  chip reads "window ▾" (the title is already in the status and the viewer's title bar). All
+  chips fit at 782 px wide on a 150% display.
+
+Exercised by hand against a loopback test host, driving the viewer with posted mouse, wheel and
+key messages:
+- The "window ▾" chip opened the picker over a monitor stream.
+- The list scrolled, the hover highlight followed the pointer, and clicking "PeetConnect test
+  window" switched to it at 41 fps, with the viewer fitted to 782x590 plus the bar.
+- A click in the video reached the test window at client (397, 255), which matches the mapping
+  (bar, title bar and border subtracted).
+- Typed "h" and "i" arrived as characters, after `FocusWindow` brought the window forward.
+- `peet_resize_window` resized the window to exactly 900x600.
+- With `window_popups = false`, window screenshots still worked.
+
+*WGC as SYSTEM (2026-11-14)*: tested without installing the service. An elevated script
+started processes with a copy of `winlogon.exe`'s token, which is SYSTEM in the console session
+on `winsta0\default`. That is how the worker runs when it falls back to the service's own token.
+- **WGC is unavailable there.** `GraphicsCaptureSession::IsSupported()` returns false, so WGC
+  cannot be used at all, for windows or monitors. Desktop Duplication works: a monitor stream
+  ran at 44 fps.
+- **Fallback, `peet-host/src/crop.rs`:** where WGC is unavailable, a window stream captures the
+  monitor under the window's centre and copies out the window's visible rectangle each frame.
+  - A move is followed in place.
+  - A resize on the same monitor makes a new cut-out texture but keeps the monitor capture.
+  - Moving to another monitor rebuilds on that monitor, recreating the device if it is on
+    another adapter.
+  - Minimised windows deliver no frames and closing is reported, as with WGC.
+  - Window screenshots cut the window out of a GDI capture of its monitor.
+  - `Feature::WindowCapture` is now always advertised.
+  - The cost: the stream shows the screen, so whatever covers the window is in the picture.
+    Input brings the window to the front.
+- **One duplication per output:** DXGI lets a process duplicate each output only once (a
+  second `DuplicateOutput` returns E_INVALIDARG). A cut-out window and a monitor stream of the
+  same monitor, or two cut-out windows on it, would collide. Whichever starts second falls back
+  to GDI: about 15–19 fps at 4K, against 40 for DXGI. Sharing one duplication per output
+  between streams would remove that cost, if it matters.
+- **Config:** `[video] window_capture = "crop"` forces the cut-out even where WGC works, for
+  testing or when WGC misbehaves.
+- **Verified:**
+  - As the user with `window_capture = "crop"`:
+    - stream at 44 fps, with a move followed;
+    - the test window's move, resize (rebuilt at 982x692), minimise, restore and close
+      sequence;
+    - a jump to DISPLAY2, rebuilt there at 38–40 fps;
+    - the screenshot;
+    - concurrent monitor and window streams (the second one on GDI).
+  - As SYSTEM with no configuration: the window listed, screenshotted (782x591) and streamed
+    at 40–46 fps.
+- **Seen but not fixed:**
+  - A client running as the user could not reach the SYSTEM worker over loopback (connection
+    timed out). A client running as SYSTEM could. Remote viewers arrive over the tailnet
+    interface instead, so this only affects local testing.
+  - `spawn_worker` in `service.rs` prefers the console user's token (`WTSQueryUserToken`) and
+    uses the SYSTEM token only when nobody is logged on, although the module doc says the
+    worker runs as SYSTEM to reach the secure desktop. As the user, WGC works but the secure
+    desktop is out of reach. That decision belongs with the untested service work (M4), not
+    M8. Window streams work under either token now.
+
+Still open:
+- **The picker lists the viewer itself** when host and viewer share a machine. Picking it gives
+  a hall of mirrors. This only happens in loopback testing, so it is left alone.
+- **Compatibility:** 0.2.x peers cannot talk to this build (protocol v2), so host and viewer
+  ship together, as 0.3.0.
+
 **Later.** Audio, multi-viewer, relay + ICE for non-Tailscale, HEVC/AV1, Linux host (PipeWire),
 Android viewer.
 
@@ -365,8 +611,9 @@ Android viewer.
 - GPUI on Windows: API churn and sparse docs. Pin a version; isolate UI from peet-core.
 - GPUI has no surface/texture element on Windows and its window has no redirection bitmap:
   video must go through DirectComposition (see M2). Do not try child HWNDs again.
-- DXGI duplication can silently deliver nothing (seen on the dev box). Always keep a GDI
-  fallback behind a watchdog, and consider Windows.Graphics.Capture.
+- DXGI duplication can silently deliver nothing. On the dev box this was probably sleeping
+  displays (WGC also drops to ~4 fps then); the host wakes them and keeps them on during a
+  session. Still keep the GDI and WGC fallbacks behind the watchdog.
 - Hardware MFTs are per-vendor; on multi-GPU machines try each until one accepts the device.
 - openh264 ships as a Cisco binary for the patent licence; bundling must follow their terms.
   Decided 2026-11-13: release builds leave it out (off-by-default `peet-codec` feature

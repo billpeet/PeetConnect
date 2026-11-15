@@ -54,7 +54,7 @@ pub struct Cli {
     /// Bitrate cap in kbit/s; viewers may ask for less.
     #[arg(long)]
     bitrate_kbps: Option<u32>,
-    /// Capture backend: auto, dxgi or gdi.
+    /// Capture backend: auto, dxgi, wgc or gdi.
     #[arg(long)]
     capture: Option<String>,
     /// Run in the foreground attached to this console.
@@ -154,7 +154,11 @@ mod clipboard;
 #[cfg(windows)]
 mod control;
 #[cfg(windows)]
+mod crop;
+#[cfg(windows)]
 mod desktop;
+#[cfg(windows)]
+mod display;
 #[cfg(windows)]
 mod machine;
 #[cfg(windows)]
@@ -167,6 +171,8 @@ mod session;
 mod stream;
 #[cfg(windows)]
 mod update;
+#[cfg(windows)]
+mod window;
 
 #[cfg(windows)]
 mod host {

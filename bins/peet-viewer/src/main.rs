@@ -27,6 +27,9 @@ struct Cli {
     /// Monitor ID to show or capture; default is the primary.
     #[arg(long)]
     monitor: Option<u32>,
+    /// Show one host window instead of a monitor: its id (hex or decimal) or part of its title.
+    #[arg(long, value_name = "ID|TITLE", conflicts_with = "loopback")]
+    window: Option<String>,
     /// Run the local loopback rig instead of a remote session.
     #[arg(long)]
     loopback: bool,
@@ -200,12 +203,19 @@ mod app {
     const FPS_PRESETS: [u32; 2] = [30, 60];
     /// The in-session bar stays visible this close to the top edge while fullscreen.
     const REVEAL_BAR_PX: f32 = 40.0;
+    /// Height of the in-session bar, logical pixels.
+    const BAR_PX: f32 = 26.0;
+    /// A viewer resize by the user is sent to the host once it has held this long.
+    const RESIZE_SETTLE: Duration = Duration::from_millis(400);
+    /// Video-area changes this soon after the viewer resized itself are its own doing.
+    const SELF_RESIZE_GRACE: Duration = Duration::from_millis(700);
 
     /// Settings a session is started with.
     #[derive(Debug, Clone)]
     struct SessionDefaults {
         pin: Option<String>,
         monitor: Option<u32>,
+        window: Option<String>,
         fps: u32,
         bitrate_kbps: u32,
         vsync: bool,
@@ -225,6 +235,7 @@ mod app {
         let defaults = SessionDefaults {
             pin: cli.pin.clone(),
             monitor: cli.monitor,
+            window: cli.window.clone(),
             fps: cli.fps.unwrap_or(config.fps),
             bitrate_kbps: cli.bitrate_kbps.unwrap_or(config.bitrate_kbps),
             vsync: !cli.no_vsync,
@@ -348,6 +359,10 @@ mod app {
         title: String,
         /// Pointer y in the window, to reveal the bar in fullscreen.
         pointer_y: f32,
+        /// The host window list is open under the bar.
+        picker_open: bool,
+        /// Window-size matching (see [`ViewerConfig::match_window_size`]).
+        size_sync: SizeSync,
         /// Last session's failure, shown on the home screen.
         last_error: Option<String>,
         /// A connect requested before the window handle was known: (target, display name).
@@ -398,6 +413,8 @@ mod app {
                 session_target: (String::new(), String::new()),
                 title: String::new(),
                 pointer_y: 0.0,
+                picker_open: false,
+                size_sync: SizeSync::default(),
                 last_error: None,
                 pending,
                 focus: cx.focus_handle(),
@@ -445,6 +462,7 @@ mod app {
                         Some(self.pin.clone())
                     },
                     monitor: self.defaults.monitor,
+                    window: self.defaults.window.clone(),
                     fps: self.defaults.fps,
                     bitrate_kbps: self.defaults.bitrate_kbps,
                 },
@@ -579,7 +597,16 @@ mod app {
                 Mode::Remote => {
                     let s = self.shared.status();
                     if s.connected {
-                        let monitor = if s.all_monitors {
+                        let monitor = if let Some(w) = &s.window {
+                            let state = if s.window_closed {
+                                " (closed)"
+                            } else if w.minimized {
+                                " (minimised)"
+                            } else {
+                                ""
+                            };
+                            format!("window {}{state}", short_title(&w.title, 40))
+                        } else if s.all_monitors {
                             format!("all {} monitors", s.monitors.len())
                         } else {
                             s.current
@@ -671,6 +698,10 @@ mod app {
                 }
                 if ks.key == "0" {
                     self.shared.select_all();
+                    return;
+                }
+                if ks.key == "w" {
+                    self.toggle_picker();
                     return;
                 }
                 if let Some(index) = ks
@@ -799,7 +830,114 @@ mod app {
         }
 
         fn select_monitor(&mut self, monitor: MonitorId) {
+            self.picker_open = false;
             self.shared.select_monitor(monitor);
+        }
+
+        /// Shows the primary monitor (or the first), leaving a window stream.
+        fn show_desktop(&mut self) {
+            let status = self.shared.status();
+            let monitor = status
+                .current
+                .or_else(|| status.monitors.iter().find(|m| m.primary).map(|m| m.id))
+                .or_else(|| status.monitors.first().map(|m| m.id));
+            if let Some(monitor) = monitor {
+                self.select_monitor(monitor);
+            }
+        }
+
+        /// Keeps the viewer and a shown host window the same size, when enabled. The host's
+        /// window resizing (or being picked) resizes the viewer to show it 1:1; the user
+        /// resizing the viewer resizes the host window once the drag settles. Changes the
+        /// viewer makes itself are never sent back, so the two cannot chase each other.
+        fn sync_window_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let status = self.shared.status();
+            let Some(shown) = status
+                .window
+                .as_ref()
+                .filter(|w| status.connected && !status.window_closed && !w.minimized)
+            else {
+                self.size_sync.fitted = None;
+                return;
+            };
+            let p = *self.placement.lock().expect("placement poisoned");
+            if p.width <= 0 || p.height <= 0 {
+                return;
+            }
+            let area = (p.width.cast_unsigned(), p.height.cast_unsigned());
+            let sync = &mut self.size_sync;
+            let now = Instant::now();
+            if !self.config.match_window_size || window.is_fullscreen() || window.is_maximized() {
+                sync.last_area = area;
+                sync.pending = false;
+                sync.fitted = None;
+                return;
+            }
+            if sync.fitted.is_none() {
+                // Newly shown window (or matching just switched on): the viewer's current
+                // size is where we start, not a resize to pass on.
+                sync.last_area = area;
+                sync.pending = false;
+            }
+            if area != sync.last_area {
+                sync.last_area = area;
+                if sync.self_resize_until.is_none_or(|t| now >= t) {
+                    sync.changed_at = Some(now);
+                    sync.pending = true;
+                }
+            }
+            let remote = (shown.bounds.width, shown.bounds.height);
+            if sync.pending {
+                if sync
+                    .changed_at
+                    .is_some_and(|t| now.duration_since(t) >= RESIZE_SETTLE)
+                {
+                    sync.pending = false;
+                    sync.fitted = Some((shown.id, area));
+                    if !near(area, remote) {
+                        tracing::debug!(?area, ?remote, "resizing host window to the viewer");
+                        self.shared.resize_window(area.0, area.1);
+                    }
+                }
+                return;
+            }
+            if sync.fitted == Some((shown.id, remote)) {
+                return;
+            }
+            sync.fitted = Some((shown.id, remote));
+            if near(area, remote) {
+                return;
+            }
+            // Fit the video area to the window at 1:1, within the local display.
+            let scale = window.scale_factor();
+            let mut w = remote.0 as f32 / scale;
+            let mut h = remote.1 as f32 / scale + BAR_PX;
+            if let Some(display) = window.display(cx) {
+                let d = display.bounds().size;
+                w = w.min(f32::from(d.width) - 16.0);
+                h = h.min(f32::from(d.height) - 80.0);
+            }
+            tracing::debug!(?area, ?remote, w, h, "resizing viewer to the host window");
+            sync.self_resize_until = Some(now + SELF_RESIZE_GRACE);
+            window.resize(size(px(w.max(200.0)), px(h.max(150.0))));
+        }
+
+        fn toggle_match_size(&mut self) {
+            self.config.match_window_size = !self.config.match_window_size;
+            self.config.save();
+            self.size_sync = SizeSync::default();
+        }
+
+        fn toggle_picker(&mut self) {
+            self.picker_open = !self.picker_open;
+            if self.picker_open {
+                self.shared.refresh_windows();
+            }
+        }
+
+        fn select_window(&mut self, window: &peet_proto::WindowInfo) {
+            self.picker_open = false;
+            self.shared.select_window(window);
         }
 
         fn on_mouse_down(
@@ -879,7 +1017,7 @@ mod app {
             let device_scale = f64::from(window.scale_factor());
             let dev_x = f64::from(f32::from(position.x)) * device_scale;
             let dev_y = f64::from(f32::from(position.y)) * device_scale;
-            let tiles = self.shared.tiles.lock().ok()?.clone();
+            let tiles = self.shared.tiles();
             let tile = tiles
                 .iter()
                 .find(|t| {
@@ -918,7 +1056,7 @@ mod app {
                 return None;
             }
             let shape = cursor.shape.clone()?;
-            let tiles = self.shared.tiles.lock().ok()?.clone();
+            let tiles = self.shared.tiles();
             let tile = tiles.iter().find(|t| {
                 let b = t.bounds;
                 cursor.x >= b.x
@@ -1105,6 +1243,182 @@ mod app {
         }
 
         /// A small clickable pill, highlighted when selected.
+        /// A card over the video when the shown window is minimised or closed on the host.
+        fn window_card(
+            s: &remote::RemoteStatus,
+            cx: &mut Context<Self>,
+        ) -> Option<gpui::AnyElement> {
+            let w = s.window.as_ref()?;
+            let (heading, detail, action): (String, &str, gpui::AnyElement) = if s.window_closed {
+                (
+                    format!("{} was closed", short_title(&w.title, 60)),
+                    "The window is gone from the host.",
+                    Self::chip(
+                        ("card", 0),
+                        "show desktop".into(),
+                        false,
+                        cx.listener(|this, _, _, _| this.show_desktop()),
+                    ),
+                )
+            } else if w.minimized {
+                (
+                    format!("{} is minimised", short_title(&w.title, 60)),
+                    "Minimised windows send no video.",
+                    Self::chip(
+                        ("card", 0),
+                        "restore".into(),
+                        false,
+                        cx.listener(|this, _, _, _| this.shared.focus_window()),
+                    ),
+                )
+            } else {
+                return None;
+            };
+            Some(
+                div()
+                    .id("window-card")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x0000_0099))
+                    .child(
+                        div()
+                            .px_6()
+                            .py_4()
+                            .rounded_lg()
+                            .bg(rgb(0x1c2028))
+                            .border_1()
+                            .border_color(rgb(0x343a46))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xf0f0f0))
+                                    .child(heading),
+                            )
+                            .child(div().text_sm().text_color(rgb(0x8a909c)).child(detail))
+                            .child(div().flex().gap_2().child(action).child(Self::chip(
+                                ("card", 1),
+                                "pick another window".into(),
+                                false,
+                                cx.listener(|this, _, _, _| {
+                                    this.picker_open = true;
+                                    this.shared.refresh_windows();
+                                }),
+                            ))),
+                    )
+                    .into_any_element(),
+            )
+        }
+
+        /// The host's windows, front to back, in a panel under the bar's window chip.
+        fn window_picker(s: &remote::RemoteStatus, cx: &mut Context<Self>) -> gpui::AnyElement {
+            let mut list = div()
+                .id("window-list")
+                .flex()
+                .flex_col()
+                .max_h(px(420.0))
+                .overflow_y_scroll();
+            if s.windows.is_empty() {
+                list = list.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .text_color(rgb(0x8a909c))
+                        .child(if s.windows_loading {
+                            "listing windows"
+                        } else {
+                            "no windows to show"
+                        }),
+                );
+            }
+            let shown = s.window.as_ref().map(|w| w.id);
+            for (i, w) in s.windows.iter().enumerate() {
+                let selected = shown == Some(w.id) && !s.window_closed;
+                let window = w.clone();
+                let mut detail = w.process.clone();
+                if w.minimized {
+                    if !detail.is_empty() {
+                        detail.push_str("  ·  ");
+                    }
+                    detail.push_str("minimised");
+                }
+                list = list.child(
+                    div()
+                        .id(("window", i))
+                        .px_3()
+                        .py_1()
+                        .flex()
+                        .flex_col()
+                        .cursor_pointer()
+                        .bg(rgb(if selected { 0x2f4f9e } else { 0x1c2028 }))
+                        .hover(|st| st.bg(rgb(0x2a2f3a)))
+                        .on_click(cx.listener(move |this, _, _, _| {
+                            this.select_window(&window);
+                        }))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0xf0f0f0))
+                                .child(short_title(&w.title, 70)),
+                        )
+                        .child(div().text_xs().text_color(rgb(0x8a909c)).child(detail)),
+                );
+            }
+            div()
+                .id("window-picker")
+                .absolute()
+                .top(px(4.0))
+                .right(px(8.0))
+                .occlude()
+                .w(px(420.0))
+                .rounded_lg()
+                .bg(rgb(0x1c2028))
+                .border_1()
+                .border_color(rgb(0x343a46))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(rgb(0x343a46))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Host windows"),
+                        )
+                        .child(Self::chip(
+                            ("picker", 0),
+                            "refresh".into(),
+                            false,
+                            cx.listener(|this, _, _, _| this.shared.refresh_windows()),
+                        ))
+                        .child(Self::chip(
+                            ("picker", 1),
+                            "close".into(),
+                            false,
+                            cx.listener(|this, _, _, _| this.picker_open = false),
+                        )),
+                )
+                .child(list)
+                .into_any_element()
+        }
+
         fn chip(
             id: (&'static str, usize),
             label: String,
@@ -1121,6 +1435,8 @@ mod app {
                 .px_2()
                 .py(px(2.0))
                 .rounded_md()
+                .flex_none()
+                .whitespace_nowrap()
                 .bg(rgb(bg))
                 .text_color(rgb(fg))
                 .cursor_pointer()
@@ -1289,8 +1605,8 @@ mod app {
                     .text_color(rgb(0x5c6370))
                     .child(
                         "In a session: Ctrl+Alt+1..9 one monitor  ·  Ctrl+Alt+0 all monitors  ·  \
-                         Ctrl+Alt+F fullscreen  ·  Ctrl+Alt+D disconnect  ·  clipboard text syncs \
-                         both ways",
+                         Ctrl+Alt+W one window  ·  Ctrl+Alt+F fullscreen  ·  Ctrl+Alt+D \
+                         disconnect  ·  clipboard text syncs both ways",
                     ),
             );
 
@@ -1316,6 +1632,35 @@ mod app {
     }
 
     /// Translates a GPUI mouse button to the protocol's.
+    /// State for keeping the viewer and a shown host window the same size.
+    #[derive(Debug, Default)]
+    struct SizeSync {
+        /// Video area (physical pixels) as last seen.
+        last_area: (u32, u32),
+        /// The user changed the video area and it has not been sent yet.
+        pending: bool,
+        changed_at: Option<Instant>,
+        /// Until then, video-area changes come from the viewer's own resize.
+        self_resize_until: Option<Instant>,
+        /// The window and remote size the two were last matched at.
+        fitted: Option<(peet_proto::WindowId, (u32, u32))>,
+    }
+
+    /// Sizes within a couple of pixels count as equal (DPI rounding).
+    fn near(a: (u32, u32), b: (u32, u32)) -> bool {
+        a.0.abs_diff(b.0) <= 2 && a.1.abs_diff(b.1) <= 2
+    }
+
+    /// `title` cut to at most `max` characters, with an ellipsis when cut.
+    fn short_title(title: &str, max: usize) -> String {
+        if title.chars().count() <= max {
+            return title.to_string();
+        }
+        let mut cut: String = title.chars().take(max.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
+
     fn map_button(button: MouseButton) -> peet_proto::MouseButton {
         match button {
             MouseButton::Left => peet_proto::MouseButton::Left,
@@ -1361,10 +1706,20 @@ mod app {
                 }
             }
             self.update_status();
+            if self.mode == Mode::Remote && self.screen == Screen::Session {
+                self.sync_window_size(window, cx);
+            }
             if self.mode == Mode::Remote {
                 let wanted = match self.screen {
                     Screen::Home => "PeetConnect".to_string(),
-                    Screen::Session => format!("{} — PeetConnect", self.session_target.1),
+                    Screen::Session => match self.shared.status().window {
+                        Some(w) => format!(
+                            "{} — {} — PeetConnect",
+                            short_title(&w.title, 80),
+                            self.session_target.1
+                        ),
+                        None => format!("{} — PeetConnect", self.session_target.1),
+                    },
                 };
                 if wanted != self.title {
                     window.set_window_title(&wanted);
@@ -1436,33 +1791,71 @@ mod app {
             let show_bar =
                 !in_session || !fullscreen || !connected || self.pointer_y < REVEAL_BAR_PX;
             let mut bar = div()
-                .h(px(26.0))
+                .h(px(BAR_PX))
                 .px_2()
                 .flex()
                 .items_center()
                 .gap_1()
                 .text_sm()
                 .bg(rgb(0x101010))
-                .child(div().flex_1().child(self.status.clone()));
+                // The status gives way to the chips: a viewer fitted to a narrow window must
+                // still reach them.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(self.status.clone()),
+                );
             if let Some(s) = &session_status {
+                let on_monitors = s.window.is_none();
                 if s.connected && s.monitors.len() > 1 {
                     for (i, m) in s.monitors.iter().take(9).enumerate() {
                         let id = m.id;
                         bar = bar.child(Self::chip(
                             ("mon", i),
                             format!("{}", i + 1),
-                            !s.all_monitors && s.current == Some(id),
+                            on_monitors && !s.all_monitors && s.current == Some(id),
                             cx.listener(move |this, _, _, _| this.select_monitor(id)),
                         ));
                     }
-                    bar = bar
-                        .child(Self::chip(
-                            ("mon", 99),
-                            "all".into(),
-                            s.all_monitors,
-                            cx.listener(|this, _, _, _| this.shared.select_all()),
-                        ))
-                        .child(div().w(px(8.0)));
+                    bar = bar.child(Self::chip(
+                        ("mon", 99),
+                        "all".into(),
+                        on_monitors && s.all_monitors,
+                        cx.listener(|this, _, _, _| {
+                            this.picker_open = false;
+                            this.shared.select_all();
+                        }),
+                    ));
+                } else if s.connected && !on_monitors {
+                    bar = bar.child(Self::chip(
+                        ("mon", 98),
+                        "desktop".into(),
+                        false,
+                        cx.listener(|this, _, _, _| this.show_desktop()),
+                    ));
+                }
+                if s.connected && s.windows_supported {
+                    // No title here: the status and the viewer's own title already show it,
+                    // and the bar has to fit a viewer fitted to a narrow window.
+                    bar = bar.child(Self::chip(
+                        ("mon", 97),
+                        "window ▾".into(),
+                        !on_monitors || self.picker_open,
+                        cx.listener(|this, _, _, _| this.toggle_picker()),
+                    ));
+                }
+                if s.connected && s.window.is_some() {
+                    bar = bar.child(Self::chip(
+                        ("mon", 96),
+                        "match size".into(),
+                        self.config.match_window_size,
+                        cx.listener(|this, _, _, _| this.toggle_match_size()),
+                    ));
+                }
+                if s.connected && (s.monitors.len() > 1 || s.windows_supported) {
+                    bar = bar.child(div().w(px(8.0)));
                 }
                 bar = bar
                     .child(Self::chip(
@@ -1485,7 +1878,7 @@ mod app {
             }
             // While (re)connecting, a card over the (frozen or empty) video says so and offers
             // a way out.
-            let overlay = session_status.filter(|s| !s.connected).map(|s| {
+            let overlay = session_status.clone().filter(|s| !s.connected).map(|s| {
                 let name = &self.session_target.1;
                 let heading = if s.reconnecting {
                     format!("Reconnecting to {name}")
@@ -1527,6 +1920,14 @@ mod app {
                             )),
                     )
             });
+            let window_card = session_status
+                .as_ref()
+                .filter(|s| s.connected)
+                .and_then(|s| Self::window_card(s, cx));
+            let picker = session_status
+                .as_ref()
+                .filter(|s| s.connected && self.picker_open && s.windows_supported)
+                .map(|s| Self::window_picker(s, cx));
             let root = if show_bar { root.child(bar) } else { root };
             root.child({
                 let mut area = div().flex_1().min_h_0().relative();
@@ -1546,7 +1947,11 @@ mod app {
                             .on_mouse_up(button, cx.listener(Self::on_mouse_up));
                     }
                 }
-                area.child(content).children(cursor).children(overlay)
+                area.child(content)
+                    .children(cursor)
+                    .children(window_card)
+                    .children(overlay)
+                    .children(picker)
             })
         }
     }

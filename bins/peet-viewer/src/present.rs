@@ -6,9 +6,9 @@
 //! visual whose content is a composition swap chain. GPUI leaves the video area transparent
 //! and our frames show through; GPUI can still draw chrome over the video.
 //!
-//! Several monitors share the one swap chain: each visible monitor gets its own converter
-//! whose output lands in that monitor's tile, and every present composites the latest tile
-//! of each monitor into the back buffer. Decoded NV12 textures are converted by the video
+//! Several sources (monitors, or one window) share the one swap chain: each visible source
+//! gets its own converter whose output lands in that source's tile, and every present
+//! composites the latest tile of each source into the back buffer. Decoded NV12 textures are converted by the video
 //! processor on the GPU, so the display path never touches system memory.
 
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use peet_capture::windows::D3dDevice;
 use peet_codec::windows::{DecodedFrame, GpuConverter};
-use peet_proto::{MonitorId, MonitorInfo};
+use peet_proto::{MonitorInfo, Rect, SourceId, WindowInfo};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HANDLE, HWND, RECT, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D11::{ID3D11RenderTargetView, ID3D11Texture2D, D3D11_BOX};
@@ -46,19 +46,44 @@ pub struct Placement {
 
 pub type SharedPlacement = Arc<Mutex<Placement>>;
 
-/// Where one monitor is drawn: `rect` in physical pixels relative to the window's client
-/// area, `bounds` the monitor's rectangle in the host's virtual desktop. Published by the
+/// A stream to show and where its picture sits in the host's virtual desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub source: SourceId,
+    pub bounds: Rect,
+}
+
+impl From<&MonitorInfo> for View {
+    fn from(m: &MonitorInfo) -> Self {
+        Self {
+            source: SourceId::Monitor(m.id),
+            bounds: m.bounds,
+        }
+    }
+}
+
+impl From<&WindowInfo> for View {
+    fn from(w: &WindowInfo) -> Self {
+        Self {
+            source: SourceId::Window(w.id),
+            bounds: w.bounds,
+        }
+    }
+}
+
+/// Where one source is drawn: `rect` in physical pixels relative to the window's client
+/// area, `bounds` the source's rectangle in the host's virtual desktop. Published by the
 /// presenter so the UI can map pointer positions and place the cursor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tile {
-    pub monitor: MonitorId,
+    pub source: SourceId,
     pub rect: RECT,
-    pub bounds: peet_proto::Rect,
+    pub bounds: Rect,
 }
 
 pub type SharedTiles = Arc<Mutex<Vec<Tile>>>;
 
-/// Per-monitor conversion state.
+/// Per-source conversion state.
 struct Slot {
     converter: GpuConverter,
     /// Most recent converted output, composited on every present.
@@ -79,10 +104,10 @@ pub struct Presenter {
     tiles: SharedTiles,
     size: (u32, u32),
     offset: (i32, i32),
-    slots: HashMap<MonitorId, Slot>,
-    /// Monitors (in order) the current layout was computed for.
-    layout_for: Vec<MonitorId>,
-    rects: HashMap<MonitorId, RECT>,
+    slots: HashMap<SourceId, Slot>,
+    /// Views (in order) the current layout was computed for.
+    layout_for: Vec<View>,
+    rects: HashMap<SourceId, RECT>,
     vsync: bool,
 }
 
@@ -91,7 +116,7 @@ impl std::fmt::Debug for Presenter {
         f.debug_struct("Presenter")
             .field("size", &self.size)
             .field("offset", &self.offset)
-            .field("monitors", &self.layout_for)
+            .field("views", &self.layout_for)
             .field("vsync", &self.vsync)
             .finish_non_exhaustive()
     }
@@ -209,13 +234,12 @@ impl Presenter {
         Ok(true)
     }
 
-    /// Recomputes tiles when the set of visible monitors (or the surface) changed.
-    fn sync_layout(&mut self, visible: &[MonitorInfo]) {
-        let ids: Vec<MonitorId> = visible.iter().map(|m| m.id).collect();
-        if ids == self.layout_for {
+    /// Recomputes tiles when the visible views (or the surface) changed.
+    fn sync_layout(&mut self, visible: &[View]) {
+        if visible == self.layout_for {
             return;
         }
-        self.layout_for = ids;
+        self.layout_for = visible.to_vec();
         self.rects = layout(visible, self.size);
         self.slots.retain(|id, _| self.rects.contains_key(id));
         for (id, slot) in &mut self.slots {
@@ -230,9 +254,9 @@ impl Presenter {
         let tiles: Vec<Tile> = visible
             .iter()
             .filter_map(|m| {
-                let r = self.rects.get(&m.id)?;
+                let r = self.rects.get(&m.source)?;
                 Some(Tile {
-                    monitor: m.id,
+                    source: m.source,
                     rect: RECT {
                         left: r.left + ox,
                         top: r.top + oy,
@@ -246,31 +270,31 @@ impl Presenter {
         *self.tiles.lock().expect("tiles poisoned") = tiles;
     }
 
-    /// Converts one monitor's frame into its tile and presents the composite of every visible
-    /// monitor's latest tile. Blocks until the swap chain has room, which with a latency of
+    /// Converts one source's frame into its tile and presents the composite of every visible
+    /// source's latest tile. Blocks until the swap chain has room, which with a latency of
     /// one means roughly one vsync.
     pub fn present(
         &mut self,
-        monitor: MonitorId,
+        source: SourceId,
         frame: &DecodedFrame,
-        visible: &[MonitorInfo],
+        visible: &[View],
     ) -> Result<()> {
         if !self.sync_placement()? {
             return Ok(());
         }
         self.sync_layout(visible);
-        let Some(&rect) = self.rects.get(&monitor) else {
+        let Some(&rect) = self.rects.get(&source) else {
             return Ok(());
         };
         let in_size = (frame.width, frame.height);
         if self
             .slots
-            .get(&monitor)
+            .get(&source)
             .is_some_and(|s| s.converter.in_size() != in_size)
         {
-            self.slots.remove(&monitor);
+            self.slots.remove(&source);
         }
-        if !self.slots.contains_key(&monitor) {
+        if !self.slots.contains_key(&source) {
             let converter = GpuConverter::nv12_to_bgra(
                 &self.device.device,
                 &self.device.context,
@@ -279,7 +303,7 @@ impl Presenter {
             )?;
             converter.set_dest_rect(Some(rect));
             self.slots.insert(
-                monitor,
+                source,
                 Slot {
                     converter,
                     latest: None,
@@ -287,7 +311,7 @@ impl Presenter {
                 },
             );
         }
-        let slot = self.slots.get_mut(&monitor).expect("slot just ensured");
+        let slot = self.slots.get_mut(&source).expect("slot just ensured");
         let converted = slot
             .converter
             .convert(&frame.texture, frame.subresource)?
@@ -350,9 +374,9 @@ impl Presenter {
     }
 }
 
-/// Lays the visible monitors out as they sit in the host's virtual desktop, scaled uniformly
-/// to fit `out` and centred. With one monitor this is a plain letterbox.
-fn layout(visible: &[MonitorInfo], out: (u32, u32)) -> HashMap<MonitorId, RECT> {
+/// Lays the visible views out as they sit in the host's virtual desktop, scaled uniformly
+/// to fit `out` and centred. With one view this is a plain letterbox.
+fn layout(visible: &[View], out: (u32, u32)) -> HashMap<SourceId, RECT> {
     let mut rects = HashMap::new();
     if visible.is_empty() {
         return rects;
@@ -381,7 +405,7 @@ fn layout(visible: &[MonitorInfo], out: (u32, u32)) -> HashMap<MonitorId, RECT> 
         let right = left + f64::from(m.bounds.width) * scale;
         let bottom = top + f64::from(m.bounds.height) * scale;
         rects.insert(
-            m.id,
+            m.source,
             RECT {
                 left: left.round() as i32,
                 top: top.round() as i32,

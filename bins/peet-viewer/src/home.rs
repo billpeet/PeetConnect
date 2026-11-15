@@ -29,6 +29,9 @@ pub struct Saved {
 pub struct ViewerConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// While one host window is shown, keep the viewer and that window the same size: the
+    /// viewer follows the window's size 1:1, and resizing the viewer resizes the window.
+    pub match_window_size: bool,
     pub favourites: Vec<Saved>,
     pub recents: Vec<Saved>,
 }
@@ -38,6 +41,7 @@ impl Default for ViewerConfig {
         Self {
             fps: 60,
             bitrate_kbps: 12000,
+            match_window_size: true,
             favourites: Vec::new(),
             recents: Vec::new(),
         }
