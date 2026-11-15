@@ -5,6 +5,8 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-15
+
 ### Added
 
 - Single-window streaming. The viewer's "window ▾" chip (or Ctrl+Alt+W) lists the host's
