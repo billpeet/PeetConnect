@@ -3,6 +3,7 @@
 //!
 //! The settings file lives at `%APPDATA%\PeetConnect\viewer.toml`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +35,8 @@ pub struct ViewerConfig {
     pub match_window_size: bool,
     pub favourites: Vec<Saved>,
     pub recents: Vec<Saved>,
+    /// Names the user gave hosts, by target. They win over discovered and saved names.
+    pub names: BTreeMap<String, String>,
 }
 
 impl Default for ViewerConfig {
@@ -44,6 +47,7 @@ impl Default for ViewerConfig {
             match_window_size: true,
             favourites: Vec::new(),
             recents: Vec::new(),
+            names: BTreeMap::new(),
         }
     }
 }
@@ -97,6 +101,53 @@ impl ViewerConfig {
         self.save();
     }
 
+    /// What to call `target`: the user's name for it, else `fallback`.
+    pub fn display_name(&self, target: &str, fallback: &str) -> String {
+        self.names
+            .get(target)
+            .cloned()
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    /// Gives `target` a name of the user's choosing; an empty (or unchanged) name clears it.
+    pub fn rename(&mut self, target: &str, name: &str, original: &str) {
+        let name = name.trim();
+        if name.is_empty() || name == original {
+            self.names.remove(target);
+        } else {
+            self.names.insert(target.to_string(), name.to_string());
+        }
+        self.save();
+    }
+
+    /// Drops `target` from favourites and recents and forgets its name.
+    pub fn forget(&mut self, target: &str) {
+        self.favourites.retain(|f| f.target != target);
+        self.recents.retain(|r| r.target != target);
+        self.names.remove(target);
+        self.save();
+    }
+
+    /// When `target` was last connected to (Unix seconds), or 0.
+    pub fn last_connected(&self, target: &str) -> u64 {
+        self.recents
+            .iter()
+            .find(|r| r.target == target)
+            .map_or(0, |r| r.when)
+    }
+
+    /// Hosts for the home screen's cards: favourites in order, then recents not already
+    /// among them.
+    pub fn computers(&self) -> Vec<Saved> {
+        let mut out = self.favourites.clone();
+        for r in &self.recents {
+            if !out.iter().any(|s| s.target == r.target) {
+                out.push(r.clone());
+            }
+        }
+        out
+    }
+
     /// Moves (or adds) `target` to the top of the recents list.
     pub fn record_recent(&mut self, target: &str, name: &str) {
         self.recents.retain(|r| r.target != target);
@@ -127,10 +178,28 @@ pub struct Peer {
     pub online: bool,
 }
 
+impl Peer {
+    /// Whether `target` (an IP, MagicDNS name or host name, optionally with `:port`) is this
+    /// device.
+    pub fn matches(&self, target: &str) -> bool {
+        let t = target.trim();
+        let host = match t.rsplit_once(':') {
+            // An IPv6 address has more colons; only strip a port after a name or IPv4.
+            Some((h, port)) if !h.contains(':') && port.parse::<u16>().is_ok() => h,
+            _ => t,
+        };
+        self.target == host
+            || self.dns_name.eq_ignore_ascii_case(host)
+            || self.name.eq_ignore_ascii_case(host)
+    }
+}
+
 /// What the discovery thread publishes.
 #[derive(Debug, Default)]
 pub struct Discovery {
     pub peers: Vec<Peer>,
+    /// This device, so a saved host that is this machine still shows as online.
+    pub this_device: Option<Peer>,
     pub self_name: String,
     pub error: Option<String>,
     pub ever_loaded: bool,
@@ -165,6 +234,14 @@ pub fn start_discovery() -> Arc<Mutex<Discovery>> {
                     match result {
                         Ok(status) if status.is_running() => {
                             d.self_name.clone_from(&status.self_node.host_name);
+                            let me = &status.self_node;
+                            d.this_device = me.primary_ip().map(|ip| Peer {
+                                name: me.host_name.clone(),
+                                dns_name: me.dns_name_trimmed().to_string(),
+                                target: ip.to_string(),
+                                os: me.os.clone(),
+                                online: true,
+                            });
                             d.peers = status
                                 .peers_sorted()
                                 .into_iter()
@@ -199,4 +276,69 @@ pub fn start_discovery() -> Arc<Mutex<Discovery>> {
         shared.lock().expect("discovery poisoned").error = Some(err.to_string());
     }
     shared
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Peer, Saved, ViewerConfig};
+
+    fn saved(target: &str) -> Saved {
+        Saved {
+            target: target.into(),
+            name: target.into(),
+            when: 0,
+        }
+    }
+
+    #[test]
+    fn computers_lists_favourites_then_new_recents() {
+        let cfg = ViewerConfig {
+            favourites: vec![saved("a"), saved("b")],
+            recents: vec![saved("c"), saved("a"), saved("d")],
+            ..ViewerConfig::default()
+        };
+        let order: Vec<_> = cfg.computers().into_iter().map(|s| s.target).collect();
+        assert_eq!(order, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn names_override_and_clear() {
+        let mut cfg = ViewerConfig::default();
+        cfg.names.insert("1.2.3.4".into(), "Study PC".into());
+        assert_eq!(cfg.display_name("1.2.3.4", "DESKTOP"), "Study PC");
+        assert_eq!(cfg.display_name("5.6.7.8", "OTHER"), "OTHER");
+        // Clearing goes through `names` directly here; `rename` would also save to disk.
+        cfg.names.remove("1.2.3.4");
+        assert_eq!(cfg.display_name("1.2.3.4", "DESKTOP"), "DESKTOP");
+    }
+
+    #[test]
+    fn names_round_trip_through_toml() {
+        let mut cfg = ViewerConfig::default();
+        cfg.favourites.push(saved("100.101.102.103"));
+        cfg.names
+            .insert("100.101.102.103".into(), "Study PC".into());
+        let text = toml::to_string_pretty(&cfg).expect("serialise");
+        let back: ViewerConfig = toml::from_str(&text).expect("parse");
+        assert_eq!(
+            back.names.get("100.101.102.103").map(String::as_str),
+            Some("Study PC")
+        );
+    }
+
+    #[test]
+    fn peer_matching() {
+        let p = Peer {
+            name: "STUDY-PC".into(),
+            dns_name: "study-pc.example.ts.net".into(),
+            target: "100.101.102.103".into(),
+            os: "windows".into(),
+            online: true,
+        };
+        assert!(p.matches("100.101.102.103"));
+        assert!(p.matches("100.101.102.103:7360"));
+        assert!(p.matches("Study-PC.example.ts.net"));
+        assert!(p.matches("study-pc"));
+        assert!(!p.matches("100.101.102.10"));
+    }
 }
