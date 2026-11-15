@@ -18,7 +18,7 @@ use peet_capture::windows::D3dDevice;
 use peet_codec::windows::MfH264Decoder;
 use peet_core::{ConnectOptions, Control, Event};
 use peet_proto::{
-    ControlMessage, CursorShape, Feature, InputEvent, MonitorId, MonitorInfo, RejectReason,
+    Codec, ControlMessage, CursorShape, Feature, InputEvent, MonitorId, MonitorInfo, RejectReason,
     SourceId, VideoFrame, WindowChange, WindowId, WindowInfo,
 };
 use smallvec::SmallVec;
@@ -353,6 +353,8 @@ pub struct SessionConfig {
     pub window: Option<String>,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// Where to keep a small screenshot of the host's primary display for the home screen.
+    pub thumbnail: Option<std::path::PathBuf>,
 }
 
 /// Connects and runs until the session ends. Blocks the calling thread.
@@ -527,6 +529,23 @@ async fn session(
             .await?;
     }
 
+    // A thumbnail shortly after connecting (once the desktop has settled), then now and then.
+    let thumb_source = config
+        .thumbnail
+        .clone()
+        .filter(|_| info.capabilities.features.contains(&Feature::Screenshot))
+        .and_then(|path| {
+            let primary = info
+                .monitors
+                .iter()
+                .find(|m| m.primary)
+                .or(info.monitors.first())?;
+            Some((path, SourceId::from(primary.id)))
+        });
+    let mut thumb_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(3),
+        Duration::from_secs(60),
+    );
     let mut rtt_tick = tokio::time::interval(Duration::from_secs(1));
     let mut quit_tick = tokio::time::interval(Duration::from_millis(100));
     let end = loop {
@@ -589,6 +608,24 @@ async fn session(
                     }
                     Event::Closed(reason) => break SessionEnd::Lost(reason),
                     Event::EndedByHost(reason) => break SessionEnd::EndedByHost(reason),
+                }
+            }
+            _ = thumb_tick.tick(), if thumb_source.is_some() => {
+                if let Some((path, source)) = thumb_source.clone() {
+                    let control = control.clone();
+                    tokio::spawn(async move {
+                        match control
+                            .screenshot(source, Codec::Png, Some(crate::thumbs::WIDTH), Duration::from_secs(10))
+                            .await
+                        {
+                            Ok(image) => {
+                                if let Err(err) = crate::thumbs::save(&path, &image.data) {
+                                    tracing::debug!(%err, "could not save thumbnail");
+                                }
+                            }
+                            Err(err) => tracing::debug!(%err, "thumbnail screenshot failed"),
+                        }
+                    });
                 }
             }
             _ = rtt_tick.tick() => {

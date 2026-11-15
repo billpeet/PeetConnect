@@ -190,3 +190,5 @@ The app icon lives in `assets/icon.svg` (with a flat `assets/icon-small.svg` for
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+The viewer's interface icons are from [Lucide](https://lucide.dev) (ISC); see `bins/peet-viewer/assets/icons/LICENSE.txt`.

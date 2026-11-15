@@ -5,6 +5,27 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.4.0 - 2026-11-15
+
+### Added
+
+- The viewer's home screen shows saved computers (pinned first, then recent) as cards with a
+  preview of the host's primary display, saved while connected and kept in
+  `%LOCALAPPDATA%\PeetConnect\thumbs`. The rest of the tailnet is listed underneath, and the
+  address box doubles as a search that filters both; Enter connects to the one match.
+- Rename computers. A details panel (pencil or "…" on a card or tailnet row) has an editable
+  name, the host's address, OS and status, a pin toggle, and "forget". Names are stored under
+  `[names]` in `viewer.toml` and are used in the session bar and window title.
+
+### Changed
+
+- New session toolbar with icons and tooltips: host name with a latency, frame-rate and
+  bitrate readout, a display switcher, a window button showing the app being streamed, and
+  match-size, fullscreen and disconnect buttons.
+- Frame rate and bitrate moved into a popover on the home screen; the PIN box appears when a
+  host asks for one or from the lock button.
+- A session started from a bare address picks up the host's name once connected.
+
 ## 0.3.0 - 2026-11-15
 
 ### Added

@@ -141,21 +141,25 @@ mod pipeline;
 mod present;
 #[cfg(windows)]
 mod remote;
+#[cfg(windows)]
+mod thumbs;
+#[cfg(windows)]
+mod ui;
 
 #[cfg(windows)]
 mod app {
     use std::sync::atomic::Ordering;
     use std::sync::mpsc::{channel, sync_channel, Receiver, Sender};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context as _, Result};
     use gpui::{
-        canvas, div, img, prelude::*, px, rgb, rgba, size, App, Application, Bounds, ClickEvent,
-        ClipboardItem, Context, FocusHandle, FontWeight, ImageSource, KeyDownEvent, Keystroke,
-        MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit,
-        Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window,
-        WindowBackgroundAppearance, WindowBounds, WindowOptions,
+        canvas, deferred, div, img, prelude::*, px, rgb, rgba, size, App, Application, Bounds,
+        ClickEvent, ClipboardItem, Context, FocusHandle, FontWeight, ImageSource, KeyDownEvent,
+        Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+        ObjectFit, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
+        TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
     };
     use peet_capture::windows::Backend;
     use peet_proto::{MonitorId, RejectReason};
@@ -165,6 +169,7 @@ mod app {
     use crate::pipeline::{self, Output, UiFrame};
     use crate::present::{Placement, SharedPlacement};
     use crate::remote::{self, RemoteShared};
+    use crate::{thumbs, ui};
     use crate::{CaptureBackend, Cli, PresentMode};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +200,15 @@ mod app {
     enum Field {
         Address,
         Pin,
+        /// The name in the details panel.
+        Name,
+    }
+
+    /// The host the details panel shows: its target and discovered (or saved) name.
+    #[derive(Debug, Clone)]
+    struct Panel {
+        target: String,
+        base: String,
     }
 
     /// Bitrate presets offered on the home screen, in kbit/s.
@@ -204,7 +218,13 @@ mod app {
     /// The in-session bar stays visible this close to the top edge while fullscreen.
     const REVEAL_BAR_PX: f32 = 40.0;
     /// Height of the in-session bar, logical pixels.
-    const BAR_PX: f32 = 26.0;
+    const BAR_PX: f32 = 40.0;
+    /// Home-screen card width and the gap between cards; four fit the column.
+    const CARD_W: f32 = 232.0;
+    const CARD_GAP: f32 = 14.0;
+    const GRID_W: f32 = CARD_W * 4.0 + CARD_GAP * 3.0;
+    /// Width of the preview in the details panel.
+    const PANEL_THUMB_W: f32 = 324.0;
     /// A viewer resize by the user is sent to the host once it has held this long.
     const RESIZE_SETTLE: Duration = Duration::from_millis(400);
     /// Video-area changes this soon after the viewer resized itself are its own doing.
@@ -289,51 +309,54 @@ mod app {
             "PeetConnect viewer (loopback)".to_string()
         };
         let initial_target = cli.connect.clone();
-        Application::new().run(move |cx: &mut App| {
-            // Closing the last window exits; the viewer's drop ends any session.
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            let bounds = Bounds::centered(None, size(px(1280.0), px(760.0)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(title.into()),
+        Application::new()
+            .with_assets(ui::Assets)
+            .run(move |cx: &mut App| {
+                // Closing the last window exits; the viewer's drop ends any session.
+                cx.on_window_closed(|cx| {
+                    if cx.windows().is_empty() {
+                        cx.quit();
+                    }
+                })
+                .detach();
+                let bounds = Bounds::centered(None, size(px(1280.0), px(760.0)), cx);
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some(title.into()),
+                            ..Default::default()
+                        }),
+                        // Composition modes draw video underneath GPUI, through a transparent hole.
+                        window_background: if mode.uses_composition() {
+                            WindowBackgroundAppearance::Transparent
+                        } else {
+                            WindowBackgroundAppearance::Opaque
+                        },
                         ..Default::default()
-                    }),
-                    // Composition modes draw video underneath GPUI, through a transparent hole.
-                    window_background: if mode.uses_composition() {
-                        WindowBackgroundAppearance::Transparent
-                    } else {
-                        WindowBackgroundAppearance::Opaque
                     },
-                    ..Default::default()
-                },
-                |_, cx| {
-                    cx.new(|cx| {
-                        Viewer::new(
-                            mode,
-                            ui_rx,
-                            win_tx,
-                            placement,
-                            config,
-                            defaults,
-                            initial_target,
-                            cx,
-                        )
-                    })
-                },
-            )
-            .expect("open window");
-            cx.activate(true);
-        });
+                    |_, cx| {
+                        cx.new(|cx| {
+                            Viewer::new(
+                                mode,
+                                ui_rx,
+                                win_tx,
+                                placement,
+                                config,
+                                defaults,
+                                initial_target,
+                                cx,
+                            )
+                        })
+                    },
+                )
+                .expect("open window");
+                cx.activate(true);
+            });
         Ok(())
     }
 
+    #[allow(clippy::struct_excessive_bools)] // independent UI flags, not a state machine
     struct Viewer {
         mode: Mode,
         screen: Screen,
@@ -353,6 +376,15 @@ mod app {
         field: Field,
         /// The last host asked for a PIN; the home screen points at the PIN box.
         needs_pin: bool,
+        /// The user opened the PIN box.
+        pin_open: bool,
+        /// The stream-quality popover is open.
+        quality_open: bool,
+        /// The details panel, when open.
+        panel: Option<Panel>,
+        /// The name being edited in the details panel.
+        name_edit: String,
+        thumbs: thumbs::Cache,
         /// Current or last session: (target, display name).
         session_target: (String, String),
         /// Window title as last set.
@@ -410,6 +442,11 @@ mod app {
                 pin: String::new(),
                 field: Field::Address,
                 needs_pin: false,
+                pin_open: false,
+                quality_open: false,
+                panel: None,
+                name_edit: String::new(),
+                thumbs: thumbs::Cache::default(),
                 session_target: (String::new(), String::new()),
                 title: String::new(),
                 pointer_y: 0.0,
@@ -433,6 +470,8 @@ mod app {
         }
 
         /// Starts a session against `target`, or queues it until the window handle is known.
+        /// `name` is the discovered or saved name; the user's own name for the host, if any,
+        /// is what the session shows.
         fn connect(&mut self, target: String, name: String) {
             let Some(hwnd) = self.hwnd else {
                 self.pending = Some((target, name));
@@ -449,10 +488,16 @@ mod app {
             self.last_error = None;
             self.last_clipboard = None;
             self.needs_pin = false;
-            self.session_target = (target.clone(), name.clone());
+            self.session_target = (target.clone(), self.config.display_name(&target, &name));
             self.config.record_recent(&target, &name);
+            self.quality_open = false;
+            self.panel = None;
+            if self.field == Field::Name {
+                self.field = Field::Address;
+            }
             self.screen = Screen::Session;
             self.status = "connecting".into();
+            let thumbnail = thumbs::path(&target);
             let config = remote::Config {
                 session: remote::SessionConfig {
                     target,
@@ -465,6 +510,7 @@ mod app {
                     window: self.defaults.window.clone(),
                     fps: self.defaults.fps,
                     bitrate_kbps: self.defaults.bitrate_kbps,
+                    thumbnail,
                 },
                 window: win_rx,
                 placement: self.placement.clone(),
@@ -488,6 +534,22 @@ mod app {
                 self.last_error = Some(format!("could not start session: {err}"));
                 self.screen = Screen::Home;
             }
+        }
+
+        /// A session started from a bare address takes the host's own name once connected,
+        /// and its recents entry learns the name too.
+        fn adopt_host_name(&mut self) {
+            let (target, name) = &self.session_target;
+            if name != target {
+                return;
+            }
+            let host = self.shared.status().host_name;
+            if host.is_empty() {
+                return;
+            }
+            let target = target.clone();
+            self.config.record_recent(&target, &host);
+            self.session_target.1 = self.config.display_name(&target, &host);
         }
 
         /// Asks the session to end; the screen flips to Home once the thread has stopped.
@@ -721,18 +783,26 @@ mod app {
             self.forward_key(ks);
         }
 
-        /// Typing on the home screen edits the active text box (address or PIN); Tab switches
-        /// between them and Enter connects.
+        /// Typing on the home screen edits the active text box (address, PIN or the panel's
+        /// name); Tab switches between address and PIN, Enter connects (or saves the name) and
+        /// Escape clears, cancels the rename, or closes what is open.
         fn on_home_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
             let m = ks.modifiers;
             match ks.key.as_str() {
+                "enter" if self.field == Field::Name => self.commit_rename(),
                 "enter" => self.connect_typed(),
                 "tab" => {
                     self.field = match self.field {
-                        Field::Address => Field::Pin,
+                        Field::Address if self.pin_visible() => Field::Pin,
                         Field::Pin => Field::Address,
+                        other => other,
                     };
                 }
+                "escape" if self.field == Field::Name => self.cancel_rename(),
+                "escape" if self.quality_open => self.quality_open = false,
+                "escape" if self.panel.is_some() => self.close_panel(),
+                // GPUI gives the space bar no key_char; names need it.
+                "space" if !m.control && !m.alt && !m.platform => self.field_mut().push(' '),
                 "backspace" => {
                     let field = self.field_mut();
                     if m.control {
@@ -764,14 +834,23 @@ mod app {
             match self.field {
                 Field::Address => &mut self.address,
                 Field::Pin => &mut self.pin,
+                Field::Name => &mut self.name_edit,
             }
         }
 
-        /// Connects to whatever is in the address box.
+        /// Connects to what the address box names: the one host a search narrowed to, else
+        /// the text itself as an address.
         fn connect_typed(&mut self) {
-            let target = self.address.trim().to_string();
-            if !target.is_empty() {
-                self.connect(target.clone(), target);
+            let typed = self.address.trim().to_string();
+            if typed.is_empty() {
+                return;
+            }
+            let matches = self.search_matches(&typed);
+            if let [(target, name)] = matches.as_slice() {
+                let (target, name) = (target.clone(), name.clone());
+                self.connect(target, name);
+            } else {
+                self.connect(typed.clone(), typed);
             }
         }
 
@@ -1087,66 +1166,463 @@ mod app {
 
         // ---- home screen -----------------------------------------------------------------
 
-        /// One clickable host row with a favourite toggle.
-        fn host_row(
-            &self,
-            id: (&'static str, usize),
-            target: &str,
-            name: String,
-            detail: String,
-            online: Option<bool>,
+        fn pin_visible(&self) -> bool {
+            self.pin_open || self.needs_pin || !self.pin.is_empty()
+        }
+
+        /// Hosts the search box narrows to: (target, discovered or saved name). Saved hosts
+        /// first, then the rest of the tailnet.
+        fn search_matches(&self, query: &str) -> Vec<(String, String)> {
+            let (peers, this_device) = self
+                .discovery
+                .lock()
+                .map(|d| (d.peers.clone(), d.this_device.clone()))
+                .unwrap_or_default();
+            let mut out: Vec<(String, String)> = Vec::new();
+            for s in self.config.computers() {
+                let peer = peers
+                    .iter()
+                    .chain(this_device.iter())
+                    .find(|p| p.matches(&s.target));
+                let base = peer.map_or(s.name.as_str(), |p| p.name.as_str());
+                let shown = self.config.display_name(&s.target, base);
+                let dns = peer.map_or("", |p| p.dns_name.as_str());
+                if query_matches(query, &[&shown, base, &s.target, dns]) {
+                    out.push((s.target.clone(), base.to_string()));
+                }
+            }
+            for p in &peers {
+                if out.iter().any(|(t, _)| p.matches(t)) {
+                    continue;
+                }
+                let shown = self.config.display_name(&p.target, &p.name);
+                if query_matches(query, &[&shown, &p.name, &p.target, &p.dns_name]) {
+                    out.push((p.target.clone(), p.name.clone()));
+                }
+            }
+            out
+        }
+
+        /// Opens the details panel for `target`; `edit` puts the cursor in its name.
+        fn open_panel(&mut self, target: String, base: String, edit: bool) {
+            self.commit_rename();
+            self.name_edit = self.config.display_name(&target, &base);
+            self.panel = Some(Panel { target, base });
+            self.quality_open = false;
+            if edit {
+                self.field = Field::Name;
+            }
+        }
+
+        fn close_panel(&mut self) {
+            self.commit_rename();
+            self.panel = None;
+        }
+
+        /// Saves the name being edited in the panel, if any.
+        fn commit_rename(&mut self) {
+            if self.field != Field::Name {
+                return;
+            }
+            self.field = Field::Address;
+            if let Some(p) = &self.panel {
+                let (target, base) = (p.target.clone(), p.base.clone());
+                self.config.rename(&target, &self.name_edit, &base);
+                self.name_edit = self.config.display_name(&target, &base);
+            }
+        }
+
+        /// Drops the name being edited and puts back the saved one.
+        fn cancel_rename(&mut self) {
+            self.field = Field::Address;
+            if let Some(p) = &self.panel {
+                self.name_edit = self.config.display_name(&p.target, &p.base);
+            }
+        }
+
+        /// Clicks on the home screen's background close the popover and the panel.
+        fn dismiss_overlays(&mut self) {
+            self.quality_open = false;
+            if self.panel.is_some() {
+                self.close_panel();
+            }
+        }
+
+        /// One saved host as a card: thumbnail, name, last connection, and on hover a way to
+        /// connect, rename or see details.
+        #[allow(clippy::too_many_arguments)]
+        fn computer_card(
+            &mut self,
+            i: usize,
+            saved: &home::Saved,
+            peer: Option<&home::Peer>,
+            now: u64,
+            window: &mut Window,
             cx: &mut Context<Self>,
         ) -> gpui::AnyElement {
-            let fav = self.config.is_favourite(target);
-            let (t1, n1) = (target.to_string(), name.clone());
-            let (t2, n2) = (target.to_string(), name.clone());
-            let text = if online == Some(false) {
-                0x777777
+            let target = saved.target.clone();
+            let base = peer.map_or_else(|| saved.name.clone(), |p| p.name.clone());
+            let name = self.config.display_name(&target, &base);
+            let online = peer.map(|p| p.online);
+            let os = peer.map_or("", |p| p.os.as_str()).to_string();
+            let pinned = self.config.is_favourite(&target);
+            let selected = self.panel.as_ref().is_some_and(|p| p.target == target);
+            let thumb = self.thumbs.get(&target, window);
+            let when = self.config.last_connected(&target);
+            let last = ui::ago(when, now);
+            let shown_last = if when == 0 {
+                "not connected yet".to_string()
             } else {
-                0xe6e6e6
+                last.clone()
             };
-            let dot = match online {
-                Some(true) => 0x3dd68c,
-                Some(false) => 0x444a55,
-                None => 0x5c6b85,
+            let sub = if name == base || base == target {
+                format!("{target}  ·  {shown_last}")
+            } else {
+                format!("{base}  ·  {shown_last}")
             };
+            let group = SharedString::from(format!("card-{i}"));
+
+            let (t_connect, n_connect) = (target.clone(), base.clone());
+            let (t_star, n_star) = (target.clone(), base.clone());
+            let (t_edit, n_edit) = (target.clone(), base.clone());
+            let (t_more, n_more) = (target.clone(), base.clone());
+
+            let mut thumb_area = div()
+                .relative()
+                .w_full()
+                .h(px(CARD_W * 10.0 / 16.0))
+                .flex_none()
+                .bg(rgb(0x0d0f12))
+                .rounded_t_lg()
+                .overflow_hidden();
+            thumb_area = match thumb {
+                Some(image) => thumb_area.child(
+                    img(ImageSource::Render(image))
+                        .size_full()
+                        .object_fit(ObjectFit::Fill)
+                        .rounded_t_lg()
+                        .when(online == Some(false), |i| i.grayscale(true)),
+                ),
+                None => thumb_area.child(Self::no_preview(&os)),
+            };
+            if online == Some(false) {
+                thumb_area =
+                    thumb_area.child(div().absolute().inset_0().bg(ui::rgba_a(0x000000, 0.45)));
+            }
+            thumb_area = thumb_area
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(ui::rgba_a(0x080a0e, 0.45))
+                        .opacity(0.0)
+                        .group_hover(group.clone(), |s| s.opacity(1.0))
+                        .child(ui::button(
+                            ("card-connect", i),
+                            Some("arrow-right"),
+                            "Connect",
+                            ui::Kind::Primary,
+                        )),
+                )
+                .child(
+                    Self::status_badge(online, &last)
+                        .absolute()
+                        .top(px(8.0))
+                        .left(px(8.0)),
+                )
+                .child(
+                    Self::badge()
+                        .id(("card-star", i))
+                        .absolute()
+                        .top(px(8.0))
+                        .right(px(8.0))
+                        .p(px(4.0))
+                        .cursor_pointer()
+                        .tooltip(ui::tooltip(if pinned { "Unpin" } else { "Pin" }, None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.config.toggle_favourite(&t_star, &n_star);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .child(if pinned {
+                            ui::icon("star-filled", 13.0, ui::color::STAR)
+                        } else {
+                            ui::icon("star", 13.0, ui::color::TEXT2)
+                        }),
+                );
+
+            let meta = div()
+                .relative()
+                .px_3()
+                .py(px(9.0))
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if online == Some(false) {
+                                    0x9aa0ac
+                                } else {
+                                    ui::color::TEXT
+                                }))
+                                .truncate()
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(ui::color::MUTED))
+                                .truncate()
+                                .child(sub),
+                        ),
+                )
+                .child(
+                    // Over the end of the text, only while hovered (or selected), so the
+                    // subtitle has the card's full width the rest of the time.
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right(px(6.0))
+                        .pl_2()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .bg(rgb(ui::color::CARD))
+                        .when(!selected, gpui::Styled::invisible)
+                        .group_hover(group.clone(), gpui::Styled::visible)
+                        .child(
+                            ui::icon_button(("card-edit", i), "pencil", 13.0, false)
+                                .tooltip(ui::tooltip("Rename", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_panel(t_edit.clone(), n_edit.clone(), true);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            ui::icon_button(("card-more", i), "ellipsis", 14.0, selected)
+                                .tooltip(ui::tooltip("Details", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_panel(t_more.clone(), n_more.clone(), false);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })),
+                        ),
+                );
+
             div()
-                .id(id)
+                .id(("card", i))
+                .group(group)
+                .w(px(CARD_W))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .rounded_lg()
+                .bg(rgb(ui::color::CARD))
+                .border_1()
+                .border_color(rgb(if selected {
+                    ui::color::ACCENT
+                } else {
+                    ui::color::BORDER
+                }))
+                .hover(|s| s.border_color(rgb(0x3d4554)).shadow_lg())
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.connect(t_connect.clone(), n_connect.clone());
+                    cx.notify();
+                }))
+                .child(thumb_area)
+                .child(meta)
+                .into_any_element()
+        }
+
+        /// Stand-in for a host that has no thumbnail yet.
+        fn no_preview(os: &str) -> gpui::Div {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .bg(rgb(0x15181d))
+                .text_xs()
+                .text_color(rgb(ui::color::FAINT))
+                .child(ui::icon(ui::os_icon(os), 22.0, ui::color::FAINT))
+                .child("No preview yet")
+        }
+
+        /// A small translucent pill over a thumbnail.
+        fn badge() -> gpui::Div {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .px(px(7.0))
+                .py(px(2.0))
+                .rounded_full()
+                .bg(ui::rgba_a(0x0a0c0f, 0.78))
+                .border_1()
+                .border_color(ui::rgba_a(0xffffff, 0.08))
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(0xffffff))
+        }
+
+        fn status_badge(online: Option<bool>, last: &str) -> gpui::Div {
+            match online {
+                Some(true) => Self::badge()
+                    .child(ui::dot(ui::color::GREEN, 7.0))
+                    .child("Online"),
+                Some(false) => Self::badge()
+                    .child(ui::dot(ui::color::OFFLINE, 7.0))
+                    .child(format!("Offline  ·  {last}")),
+                None => Self::badge()
+                    .child(ui::dot(0x5c6b85, 7.0))
+                    .child("Not on tailnet"),
+            }
+        }
+
+        /// One tailnet device that is not among the saved hosts.
+        fn tailnet_row(
+            &self,
+            i: usize,
+            p: &home::Peer,
+            first: bool,
+            cx: &mut Context<Self>,
+        ) -> gpui::AnyElement {
+            let name = self.config.display_name(&p.target, &p.name);
+            let fav = self.config.is_favourite(&p.target);
+            let (t1, n1) = (p.target.clone(), p.name.clone());
+            let (t2, n2) = (p.target.clone(), p.name.clone());
+            let (t3, n3) = (p.target.clone(), p.name.clone());
+            let selected = self.panel.as_ref().is_some_and(|x| x.target == p.target);
+            div()
+                .id(("peer", i))
+                .w_full()
                 .flex()
                 .items_center()
                 .gap_3()
+                .h(px(46.0))
                 .px_3()
-                .py_2()
-                .rounded_md()
+                .when(!first, |d| {
+                    d.border_t_1().border_color(rgb(ui::color::BORDER))
+                })
+                .when(selected, |d| d.bg(ui::rgba_a(ui::color::ACCENT, 0.10)))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x2a2f3a)))
+                .hover(|s| s.bg(rgb(0x20242c)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.connect(t1.clone(), n1.clone());
                     cx.notify();
                 }))
                 .child(
                     div()
-                        .id((id.0, id.1 + 10_000))
-                        .w(px(22.0))
-                        .text_center()
-                        .cursor_pointer()
-                        .text_color(rgb(if fav { 0xffc53d } else { 0x555b66 }))
-                        .hover(|s| s.text_color(rgb(0xffc53d)))
+                        .size(px(28.0))
+                        .flex_none()
+                        .rounded_md()
+                        .bg(rgb(ui::color::RAISE))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(ui::icon(ui::os_icon(&p.os), 15.0, ui::color::TEXT2)),
+                )
+                .child(
+                    div()
+                        .w(px(190.0))
+                        .flex_none()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(if p.online { ui::color::TEXT } else { 0x777d88 }))
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(if p.online {
+                            ui::color::MUTED
+                        } else {
+                            ui::color::FAINT
+                        }))
+                        .child(p.dns_name.clone()),
+                )
+                .child(
+                    div()
+                        .w(px(110.0))
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(ui::color::MUTED))
+                        .child(p.target.clone()),
+                )
+                .child(
+                    div()
+                        .w(px(70.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_xs()
+                        .text_color(rgb(if p.online {
+                            ui::color::TEXT2
+                        } else {
+                            ui::color::FAINT
+                        }))
+                        .child(ui::dot(
+                            if p.online {
+                                ui::color::GREEN
+                            } else {
+                                ui::color::OFFLINE
+                            },
+                            7.0,
+                        ))
+                        .child(if p.online { "Online" } else { "Offline" }),
+                )
+                .child(
+                    div()
+                        .id(("peer-star", i))
+                        .size(px(26.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .hover(|s| s.bg(rgb(ui::color::RAISE)))
+                        .tooltip(ui::tooltip(if fav { "Unpin" } else { "Pin" }, None))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.config.toggle_favourite(&t2, &n2);
                             cx.stop_propagation();
                             cx.notify();
                         }))
-                        .child(if fav { "★" } else { "☆" }),
+                        .child(if fav {
+                            ui::icon("star-filled", 14.0, ui::color::STAR)
+                        } else {
+                            ui::icon("star", 14.0, ui::color::FAINT)
+                        }),
                 )
-                .child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(rgb(dot)))
                 .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .child(div().text_color(rgb(text)).child(name))
-                        .child(div().text_xs().text_color(rgb(0x8a909c)).child(detail)),
+                    ui::icon_button(("peer-more", i), "ellipsis", 14.0, selected)
+                        .size(px(26.0))
+                        .tooltip(ui::tooltip("Details", None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_panel(t3.clone(), n3.clone(), false);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
                 )
                 .into_any_element()
         }
@@ -1158,91 +1634,751 @@ mod app {
             id: &'static str,
             field: Field,
             placeholder: &'static str,
+            leading: Option<&'static str>,
             cx: &mut Context<Self>,
-        ) -> gpui::AnyElement {
+        ) -> gpui::Stateful<gpui::Div> {
             let active = self.field == field;
             let value = match field {
                 Field::Address => &self.address,
                 Field::Pin => &self.pin,
+                Field::Name => &self.name_edit,
             };
             let shown = if field == Field::Pin {
                 "•".repeat(value.chars().count())
             } else {
                 value.clone()
             };
-            let caret = if active { "▏" } else { "" };
-            let content = if value.is_empty() {
-                div()
-                    .text_color(rgb(0x6a7080))
-                    .child(format!("{caret}{placeholder}"))
+            let caret = || div().w(px(1.0)).h(px(16.0)).flex_none().bg(rgb(0xffffff));
+            let mut content = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .overflow_hidden();
+            content = if value.is_empty() {
+                content.when(active, |c| c.child(caret())).child(
+                    div()
+                        .truncate()
+                        .text_color(rgb(0x6a7080))
+                        .child(placeholder),
+                )
             } else {
-                div()
-                    .text_color(rgb(0xf0f0f0))
-                    .child(format!("{shown}{caret}"))
+                content
+                    .child(div().truncate().text_color(rgb(0xf0f0f0)).child(shown))
+                    .when(active, |c| c.child(caret()))
             };
             let border = if active {
-                0x4c7dff
+                ui::color::ACCENT
             } else if field == Field::Pin && self.needs_pin {
-                0xff7b72
+                ui::color::ERROR
             } else {
-                0x343a46
+                ui::color::BORDER2
             };
             div()
                 .id(id)
+                .h(px(36.0))
                 .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(0x1c2028))
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_lg()
+                .bg(rgb(ui::color::FIELD))
                 .border_1()
                 .border_color(rgb(border))
                 .cursor_text()
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    if field != Field::Name {
+                        this.commit_rename();
+                    }
                     this.field = field;
                     cx.notify();
                 }))
+                .children(leading.map(|name| ui::icon(name, 15.0, ui::color::MUTED)))
                 .child(content)
-                .into_any_element()
         }
 
-        /// Frame-rate and bitrate presets; a click applies to the next session and persists.
-        fn settings_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-            let mut row = div()
-                .mt_3()
-                .px_1()
+        /// The stream-quality button and, when open, its popover of presets.
+        fn quality_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+            let label = format!(
+                "{} fps  ·  {} Mbit/s",
+                self.defaults.fps,
+                self.defaults.bitrate_kbps / 1000
+            );
+            let button = div()
+                .id("quality")
+                .h(px(36.0))
+                .px_3()
                 .flex()
                 .items_center()
-                .flex_wrap()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(if self.quality_open {
+                    ui::color::ACCENT
+                } else {
+                    ui::color::BORDER2
+                }))
+                .bg(rgb(ui::color::FIELD))
+                .hover(|s| s.bg(rgb(0x20242b)))
+                .cursor_pointer()
+                .whitespace_nowrap()
+                .text_sm()
+                .text_color(rgb(ui::color::TEXT2))
+                .when(!self.quality_open, |b| {
+                    b.tooltip(ui::tooltip("Stream quality for new connections", None))
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.quality_open = !this.quality_open;
+                    cx.notify();
+                }))
+                .child(ui::icon("sliders", 15.0, ui::color::TEXT2))
+                .child(label)
+                .child(ui::icon("chevron-down", 14.0, ui::color::MUTED));
+            let mut wrap = div().relative().flex_none().child(button);
+            if self.quality_open {
+                let mut fps_row = div().flex().gap_1();
+                for (i, &fps) in FPS_PRESETS.iter().enumerate() {
+                    fps_row = fps_row.child(Self::chip(
+                        ("fps", i),
+                        format!("{fps} fps"),
+                        self.defaults.fps == fps,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_fps(fps);
+                            cx.notify();
+                        }),
+                    ));
+                }
+                let mut kbps_row = div().flex().flex_wrap().gap_1();
+                for (i, &kbps) in BITRATE_PRESETS.iter().enumerate() {
+                    kbps_row = kbps_row.child(Self::chip(
+                        ("kbps", i),
+                        format!("{} Mbit/s", kbps / 1000),
+                        self.defaults.bitrate_kbps == kbps,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_bitrate(kbps);
+                            cx.notify();
+                        }),
+                    ));
+                }
+                let label = |t: &'static str| {
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(ui::color::MUTED))
+                        .child(t)
+                };
+                wrap = wrap.child(deferred(
+                    div()
+                        .id("quality-menu")
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .absolute()
+                        .top(px(42.0))
+                        .right_0()
+                        .w(px(300.0))
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .rounded_lg()
+                        .bg(rgb(0x23272f))
+                        .border_1()
+                        .border_color(rgb(0x3a404c))
+                        .shadow_lg()
+                        .child(label("FRAME RATE"))
+                        .child(fps_row)
+                        .child(div().h(px(4.0)))
+                        .child(label("BITRATE"))
+                        .child(kbps_row)
+                        .child(
+                            div()
+                                .pt_1()
+                                .text_xs()
+                                .text_color(rgb(ui::color::FAINT))
+                                .child("Applies to the next connection."),
+                        ),
+                ));
+            }
+            wrap.into_any_element()
+        }
+
+        fn section(icon: &'static str, title: &'static str, detail: Option<String>) -> gpui::Div {
+            div()
+                .mt_5()
+                .mb(px(10.0))
+                .flex()
+                .items_center()
                 .gap_2()
                 .text_xs()
-                .text_color(rgb(0x8a909c))
-                .child("frame rate");
-            for (i, &fps) in FPS_PRESETS.iter().enumerate() {
-                row = row.child(Self::chip(
-                    ("fps", i),
-                    format!("{fps}"),
-                    self.defaults.fps == fps,
-                    cx.listener(move |this, _, _, cx| {
-                        this.set_fps(fps);
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(ui::color::MUTED))
+                .child(ui::icon(icon, 13.0, ui::color::MUTED))
+                .child(title)
+                .children(detail.map(|d| {
+                    div()
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(rgb(ui::color::FAINT))
+                        .child(d)
+                }))
+                .child(div().flex_1().h(px(1.0)).bg(rgb(ui::color::BORDER)))
+        }
+
+        /// The details panel on the right: preview, editable name, facts, pin, connect, forget.
+        fn side_panel(
+            &mut self,
+            peers: &[home::Peer],
+            now: u64,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Option<gpui::AnyElement> {
+            let Panel { target, base } = self.panel.clone()?;
+            let peer = peers.iter().find(|p| p.matches(&target));
+            let thumb = self.thumbs.get(&target, window);
+            let renamed = self.config.names.contains_key(&target);
+            let pinned = self.config.is_favourite(&target);
+            let known = renamed || pinned || self.config.recents.iter().any(|r| r.target == target);
+            let editing = self.field == Field::Name;
+            let online = peer.map(|p| p.online);
+            let last = ui::ago(self.config.last_connected(&target), now);
+            let os = peer.map_or("", |p| p.os.as_str()).to_string();
+
+            let mut preview = div()
+                .relative()
+                .w_full()
+                .h(px(PANEL_THUMB_W * 10.0 / 16.0))
+                .rounded_lg()
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgb(ui::color::BORDER))
+                .bg(rgb(0x0d0f12));
+            preview = match thumb {
+                Some(image) => preview.child(
+                    img(ImageSource::Render(image))
+                        .size_full()
+                        .object_fit(ObjectFit::Fill)
+                        .rounded_lg(),
+                ),
+                None => preview.child(Self::no_preview(&os)),
+            };
+            preview = preview.child(
+                Self::status_badge(online, &last)
+                    .absolute()
+                    .top(px(8.0))
+                    .left(px(8.0)),
+            );
+
+            let name_box = self
+                .text_box("panel-name", Field::Name, "Name", None, cx)
+                .h(px(40.0))
+                .text_lg()
+                .font_weight(FontWeight::BOLD)
+                .when(!editing, |b| {
+                    b.child(ui::icon("pencil", 14.0, ui::color::MUTED))
+                });
+            let hint = if editing {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(ui::kbd("Enter"))
+                    .child("save")
+                    .child(div().w(px(6.0)))
+                    .child(ui::kbd("Esc"))
+                    .child("cancel")
+                    .child(div().w(px(6.0)))
+                    .child(format!("·  hostname {base}"))
+            } else if renamed {
+                let (t, b) = (target.clone(), base.clone());
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(format!("Hostname {base}  ·"))
+                    .child(
+                        div()
+                            .id("panel-reset")
+                            .text_color(rgb(ui::color::ACCENT_SOFT))
+                            .cursor_pointer()
+                            .hover(gpui::Styled::underline)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.config.rename(&t, "", &b);
+                                this.name_edit.clone_from(&b);
+                                cx.notify();
+                            }))
+                            .child("use hostname"),
+                    )
+            } else {
+                div().child("Click the name to rename this computer.")
+            };
+
+            let kv = |k: &'static str, v: gpui::AnyElement| {
+                div()
+                    .h(px(36.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(rgb(ui::color::BORDER))
+                    .text_sm()
+                    .child(div().flex_none().text_color(rgb(ui::color::MUTED)).child(k))
+                    .child(v)
+            };
+            let text = |s: String| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(rgb(ui::color::TEXT))
+                    .child(s)
+                    .into_any_element()
+            };
+            let status = match online {
+                Some(true) => "Online",
+                Some(false) => "Offline",
+                None => "Not seen on the tailnet",
+            };
+            let (t_pin, n_pin) = (target.clone(), base.clone());
+            let toggle = div()
+                .id("panel-pin")
+                .w(px(34.0))
+                .h(px(20.0))
+                .rounded_full()
+                .relative()
+                .cursor_pointer()
+                .bg(rgb(if pinned { ui::color::ACCENT } else { 0x3a404c }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.config.toggle_favourite(&t_pin, &n_pin);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(3.0))
+                        .when(pinned, |d| d.right(px(3.0)))
+                        .when(!pinned, |d| d.left(px(3.0)))
+                        .size(px(14.0))
+                        .rounded_full()
+                        .bg(rgb(if pinned { 0xffffff } else { 0x9aa0ac })),
+                );
+
+            let (t_conn, n_conn) = (target.clone(), base.clone());
+            let t_forget = target.clone();
+            let footer = div()
+                .px(px(18.0))
+                .pb(px(18.0))
+                .flex()
+                .gap_2()
+                .child(
+                    ui::button(
+                        "panel-connect",
+                        Some("arrow-right"),
+                        "Connect",
+                        ui::Kind::Primary,
+                    )
+                    .h(px(36.0))
+                    .flex_1()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_panel();
+                        this.connect(t_conn.clone(), n_conn.clone());
                         cx.notify();
-                    }),
-                ));
-            }
-            row = row.child(div().w(px(10.0))).child("bitrate");
-            for (i, &kbps) in BITRATE_PRESETS.iter().enumerate() {
-                row = row.child(Self::chip(
-                    ("kbps", i),
-                    format!("{} Mbit/s", kbps / 1000),
-                    self.defaults.bitrate_kbps == kbps,
-                    cx.listener(move |this, _, _, cx| {
-                        this.set_bitrate(kbps);
-                        cx.notify();
-                    }),
-                ));
-            }
-            row.into_any_element()
+                    })),
+                )
+                .when(known, |f| {
+                    f.child(
+                        ui::icon_button("panel-forget", "trash", 15.0, false)
+                            .size(px(36.0))
+                            .border_1()
+                            .border_color(rgb(ui::color::BORDER2))
+                            .bg(rgb(ui::color::RAISE))
+                            .tooltip(ui::tooltip(
+                                "Forget: unpin, clear the name and preview",
+                                None,
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.field = Field::Address;
+                                this.panel = None;
+                                this.config.forget(&t_forget);
+                                thumbs::remove(&t_forget);
+                                this.thumbs.forget(&t_forget, window);
+                                cx.notify();
+                            })),
+                    )
+                });
+
+            Some(
+                div()
+                    .id("panel")
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(PANEL_THUMB_W + 36.0))
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(0x191c22))
+                    .border_l_1()
+                    .border_color(rgb(0x333944))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .pl(px(18.0))
+                            .pr(px(10.0))
+                            .pt(px(10.0))
+                            .pb(px(8.0))
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(ui::color::MUTED))
+                                    .child("COMPUTER"),
+                            )
+                            .child(
+                                ui::icon_button("panel-close", "x", 16.0, false)
+                                    .tooltip(ui::tooltip("Close", Some("Esc".into())))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_panel();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().px(px(18.0)).child(preview))
+                    .child(
+                        div().px(px(18.0)).pt(px(14.0)).child(name_box).child(
+                            div()
+                                .mt(px(6.0))
+                                .mb(px(12.0))
+                                .px(px(2.0))
+                                .text_xs()
+                                .text_color(rgb(ui::color::MUTED))
+                                .child(hint),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("panel-facts")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .px(px(18.0))
+                            .child(kv("Address", text(target.clone())))
+                            .child(kv(
+                                "MagicDNS",
+                                text(peer.map_or_else(|| "—".into(), |p| p.dns_name.clone())),
+                            ))
+                            .child(kv("System", text(ui::os_name(&os))))
+                            .child(kv("Status", text(status.into())))
+                            .child(kv("Last connected", text(last.clone())))
+                            .child(kv("Pinned", toggle.into_any_element())),
+                    )
+                    .child(footer)
+                    .into_any_element(),
+            )
         }
 
         /// A small clickable pill, highlighted when selected.
+        fn chip(
+            id: (&'static str, usize),
+            label: String,
+            selected: bool,
+            on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        ) -> gpui::AnyElement {
+            ui::button(
+                id,
+                None,
+                label,
+                if selected {
+                    ui::Kind::Selected
+                } else {
+                    ui::Kind::Ghost
+                },
+            )
+            .h(px(26.0))
+            .px_2()
+            .font_weight(FontWeight::MEDIUM)
+            .on_click(on_click)
+            .into_any_element()
+        }
+
+        fn render_home(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+            let (peers, this_device, disc_error, loaded) = self
+                .discovery
+                .lock()
+                .map(|d| {
+                    (
+                        d.peers.clone(),
+                        d.this_device.clone(),
+                        d.error.clone(),
+                        d.ever_loaded,
+                    )
+                })
+                .unwrap_or_default();
+            // Saved hosts can be this machine; the tailnet list never shows it.
+            let known: Vec<home::Peer> = peers.iter().cloned().chain(this_device).collect();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let query = self.address.trim().to_string();
+
+            // Saved hosts as cards, the rest of the tailnet as rows; the search box filters both.
+            let computers = self.config.computers();
+            let mut cards = Vec::new();
+            for (i, s) in computers.iter().enumerate() {
+                let peer = known.iter().find(|p| p.matches(&s.target));
+                let base = peer.map_or(s.name.as_str(), |p| p.name.as_str());
+                let shown = self.config.display_name(&s.target, base);
+                let dns = peer.map_or("", |p| p.dns_name.as_str());
+                if !query_matches(&query, &[&shown, base, &s.target, dns]) {
+                    continue;
+                }
+                cards.push(self.computer_card(i, s, peer, now, window, cx));
+            }
+            let others: Vec<&home::Peer> = peers
+                .iter()
+                .filter(|p| !computers.iter().any(|s| p.matches(&s.target)))
+                .collect();
+            let rows: Vec<_> = others
+                .iter()
+                .filter(|p| {
+                    let shown = self.config.display_name(&p.target, &p.name);
+                    query_matches(&query, &[&shown, &p.name, &p.target, &p.dns_name])
+                })
+                .enumerate()
+                .map(|(i, p)| self.tailnet_row(i, p, i == 0, cx))
+                .collect();
+
+            let pin_box = self.pin_visible().then(|| {
+                self.text_box("pin", Field::Pin, "PIN", Some("lock"), cx)
+                    .w(px(130.0))
+                    .flex_none()
+            });
+            let header = div()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .flex_none()
+                        .mr_2()
+                        .child(img("brand/icon.png").size(px(26.0)))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xf0f0f0))
+                                .child("PeetConnect"),
+                        ),
+                )
+                .child(
+                    self.text_box(
+                        "address",
+                        Field::Address,
+                        "Search, or type a MagicDNS name or Tailscale IP",
+                        Some("search"),
+                        cx,
+                    )
+                    .flex_1()
+                    .min_w_0()
+                    .child(ui::kbd("Enter")),
+                )
+                .children(pin_box)
+                .when(!self.pin_visible(), |h| {
+                    h.child(
+                        ui::icon_button("pin-toggle", "lock", 15.0, false)
+                            .size(px(36.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(ui::color::BORDER2))
+                            .bg(rgb(ui::color::FIELD))
+                            .tooltip(ui::tooltip("Enter a PIN", None))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.commit_rename();
+                                this.pin_open = true;
+                                this.field = Field::Pin;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(self.quality_menu(cx));
+
+            let mut column = div()
+                .flex()
+                .flex_col()
+                .w(px(GRID_W))
+                .max_w_full()
+                .child(header);
+            for err in self.last_error.iter().chain(disc_error.iter()) {
+                column = column.child(
+                    div()
+                        .mt_3()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(ui::rgba_a(ui::color::ERROR, 0.08))
+                        .border_1()
+                        .border_color(ui::rgba_a(ui::color::ERROR, 0.25))
+                        .text_sm()
+                        .text_color(rgb(ui::color::ERROR))
+                        .child(err.clone()),
+                );
+            }
+
+            column = column.child(Self::section(
+                "monitor",
+                "COMPUTERS",
+                Some("pinned first, then recent".into()),
+            ));
+            if computers.is_empty() {
+                column = column.child(
+                    div()
+                        .px_4()
+                        .py_5()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(ui::color::BORDER))
+                        .text_sm()
+                        .text_color(rgb(ui::color::MUTED))
+                        .child(
+                            "Computers you connect to or pin show up here, with a preview of \
+                             their screen.",
+                        ),
+                );
+            } else if cards.is_empty() {
+                column = column.child(
+                    div()
+                        .px_1()
+                        .text_sm()
+                        .text_color(rgb(ui::color::MUTED))
+                        .child(format!(
+                            "No saved computer matches \u{201c}{query}\u{201d}."
+                        )),
+                );
+            } else {
+                column = column.child(div().flex().flex_wrap().gap(px(CARD_GAP)).children(cards));
+            }
+
+            let refresh = div()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .font_weight(FontWeight::NORMAL)
+                .child(ui::icon("refresh", 12.0, ui::color::FAINT))
+                .child("live");
+            column = column.child(
+                Self::section(
+                    "network",
+                    "TAILNET",
+                    Some(format!("{} more devices", others.len())),
+                )
+                .child(refresh),
+            );
+            if !loaded {
+                column = column.child(
+                    div()
+                        .px_1()
+                        .text_sm()
+                        .text_color(rgb(ui::color::MUTED))
+                        .child("looking for devices"),
+                );
+            } else if rows.is_empty() && disc_error.is_none() {
+                column = column.child(
+                    div()
+                        .px_1()
+                        .text_sm()
+                        .text_color(rgb(ui::color::MUTED))
+                        .child(if others.is_empty() {
+                            "no other devices on the tailnet".to_string()
+                        } else {
+                            format!("no tailnet device matches \u{201c}{query}\u{201d}")
+                        }),
+                );
+            } else if !rows.is_empty() {
+                column = column.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .overflow_hidden()
+                        .bg(rgb(ui::color::PANEL))
+                        .border_1()
+                        .border_color(rgb(ui::color::BORDER))
+                        .children(rows),
+                );
+            }
+
+            let mut keys = div()
+                .mt_6()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_x_4()
+                .gap_y_2()
+                .text_xs()
+                .text_color(rgb(ui::color::FAINT))
+                .child("In a session:");
+            for (key, what) in [
+                ("Ctrl Alt 1–9", "one display"),
+                ("Ctrl Alt 0", "all displays"),
+                ("Ctrl Alt W", "pick a window"),
+                ("Ctrl Alt F", "fullscreen"),
+                ("Ctrl Alt D", "disconnect"),
+            ] {
+                keys = keys.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(ui::kbd(key))
+                        .child(what),
+                );
+            }
+            column = column.child(keys).child(
+                div()
+                    .mt_2()
+                    .text_xs()
+                    .text_color(rgb(ui::color::FAINT))
+                    .child("Clipboard text syncs both ways."),
+            );
+
+            let panel = self.side_panel(&known, now, window, cx);
+            div()
+                .size_full()
+                .relative()
+                .bg(rgb(ui::color::BG))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.dismiss_overlays();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("home")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .flex()
+                        .justify_center()
+                        .pt(px(22.0))
+                        .pb_8()
+                        .px_6()
+                        .child(column),
+                )
+                .children(panel)
+                .into_any_element()
+        }
+
+        // ---- session overlays ------------------------------------------------------------
+
         /// A card over the video when the shown window is minimised or closed on the host.
         fn window_card(
             s: &remote::RemoteStatus,
@@ -1255,7 +2391,7 @@ mod app {
                     "The window is gone from the host.",
                     Self::chip(
                         ("card", 0),
-                        "show desktop".into(),
+                        "Show desktop".into(),
                         false,
                         cx.listener(|this, _, _, _| this.show_desktop()),
                     ),
@@ -1266,7 +2402,7 @@ mod app {
                     "Minimised windows send no video.",
                     Self::chip(
                         ("card", 0),
-                        "restore".into(),
+                        "Restore".into(),
                         false,
                         cx.listener(|this, _, _, _| this.shared.focus_window()),
                     ),
@@ -1284,46 +2420,57 @@ mod app {
                     .items_center()
                     .justify_center()
                     .bg(rgba(0x0000_0099))
-                    .child(
-                        div()
-                            .px_6()
-                            .py_4()
-                            .rounded_lg()
-                            .bg(rgb(0x1c2028))
-                            .border_1()
-                            .border_color(rgb(0x343a46))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xf0f0f0))
-                                    .child(heading),
-                            )
-                            .child(div().text_sm().text_color(rgb(0x8a909c)).child(detail))
-                            .child(div().flex().gap_2().child(action).child(Self::chip(
-                                ("card", 1),
-                                "pick another window".into(),
-                                false,
-                                cx.listener(|this, _, _, _| {
-                                    this.picker_open = true;
-                                    this.shared.refresh_windows();
-                                }),
-                            ))),
-                    )
+                    .child(Self::overlay_card(heading, detail.to_string()).child(
+                        div().flex().gap_2().child(action).child(Self::chip(
+                            ("card", 1),
+                            "Pick another window".into(),
+                            false,
+                            cx.listener(|this, _, _, _| {
+                                this.picker_open = true;
+                                this.shared.refresh_windows();
+                            }),
+                        )),
+                    ))
                     .into_any_element(),
             )
         }
 
-        /// The host's windows, front to back, in a panel under the bar's window chip.
+        /// The box used by the session's centred messages.
+        fn overlay_card(heading: String, detail: String) -> gpui::Div {
+            div()
+                .px_6()
+                .py_4()
+                .rounded_lg()
+                .bg(rgb(ui::color::CARD))
+                .border_1()
+                .border_color(rgb(ui::color::BORDER2))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xf0f0f0))
+                        .child(heading),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(ui::color::MUTED))
+                        .child(detail),
+                )
+        }
+
+        /// The host's windows, front to back, in a panel under the bar's window button.
         fn window_picker(s: &remote::RemoteStatus, cx: &mut Context<Self>) -> gpui::AnyElement {
             let mut list = div()
                 .id("window-list")
                 .flex()
                 .flex_col()
+                .p_1()
                 .max_h(px(420.0))
                 .overflow_y_scroll();
             if s.windows.is_empty() {
@@ -1332,7 +2479,7 @@ mod app {
                         .px_3()
                         .py_2()
                         .text_sm()
-                        .text_color(rgb(0x8a909c))
+                        .text_color(rgb(ui::color::MUTED))
                         .child(if s.windows_loading {
                             "listing windows"
                         } else {
@@ -1354,47 +2501,74 @@ mod app {
                 list = list.child(
                     div()
                         .id(("window", i))
-                        .px_3()
+                        .px_2()
                         .py_1()
                         .flex()
-                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .rounded_md()
                         .cursor_pointer()
-                        .bg(rgb(if selected { 0x2f4f9e } else { 0x1c2028 }))
-                        .hover(|st| st.bg(rgb(0x2a2f3a)))
+                        .when(selected, |d| d.bg(rgb(ui::color::ACCENT_BG)))
+                        .when(!selected, |d| d.hover(|st| st.bg(rgb(ui::color::RAISE))))
                         .on_click(cx.listener(move |this, _, _, _| {
                             this.select_window(&window);
                         }))
+                        .child(ui::icon(
+                            "app-window",
+                            16.0,
+                            if selected { 0xffffff } else { ui::color::MUTED },
+                        ))
                         .child(
                             div()
-                                .text_sm()
-                                .text_color(rgb(0xf0f0f0))
-                                .child(short_title(&w.title, 70)),
-                        )
-                        .child(div().text_xs().text_color(rgb(0x8a909c)).child(detail)),
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .truncate()
+                                        .text_color(rgb(0xf0f0f0))
+                                        .child(short_title(&w.title, 70)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(if selected {
+                                            0xc9d6ff
+                                        } else {
+                                            ui::color::MUTED
+                                        }))
+                                        .child(detail),
+                                ),
+                        ),
                 );
             }
             div()
                 .id("window-picker")
                 .absolute()
-                .top(px(4.0))
+                .top(px(6.0))
                 .right(px(8.0))
                 .occlude()
                 .w(px(420.0))
                 .rounded_lg()
-                .bg(rgb(0x1c2028))
+                .bg(rgb(0x1f232b))
                 .border_1()
-                .border_color(rgb(0x343a46))
+                .border_color(rgb(0x3a404c))
+                .shadow_lg()
                 .flex()
                 .flex_col()
                 .child(
                     div()
-                        .px_3()
-                        .py_2()
+                        .pl_3()
+                        .pr_1()
+                        .py_1()
                         .flex()
                         .items_center()
                         .gap_1()
                         .border_b_1()
-                        .border_color(rgb(0x343a46))
+                        .border_color(rgb(ui::color::BORDER2))
+                        .child(ui::icon("app-window", 14.0, ui::color::MUTED))
                         .child(
                             div()
                                 .flex_1()
@@ -1402,225 +2576,314 @@ mod app {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child("Host windows"),
                         )
-                        .child(Self::chip(
-                            ("picker", 0),
-                            "refresh".into(),
-                            false,
-                            cx.listener(|this, _, _, _| this.shared.refresh_windows()),
-                        ))
-                        .child(Self::chip(
-                            ("picker", 1),
-                            "close".into(),
-                            false,
-                            cx.listener(|this, _, _, _| this.picker_open = false),
-                        )),
+                        .child(
+                            ui::icon_button(("picker", 0usize), "refresh", 14.0, false)
+                                .tooltip(ui::tooltip("Refresh", None))
+                                .on_click(
+                                    cx.listener(|this, _, _, _| this.shared.refresh_windows()),
+                                ),
+                        )
+                        .child(
+                            ui::icon_button(("picker", 1usize), "x", 15.0, false)
+                                .tooltip(ui::tooltip("Close", None))
+                                .on_click(cx.listener(|this, _, _, _| this.picker_open = false)),
+                        ),
                 )
                 .child(list)
                 .into_any_element()
         }
 
-        fn chip(
-            id: (&'static str, usize),
-            label: String,
-            selected: bool,
-            on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-        ) -> gpui::AnyElement {
-            let (bg, fg) = if selected {
-                (0x2f4f9e, 0xffffff)
-            } else {
-                (0x1c2028, 0x9aa0ac)
+        /// The bar above the video: host and link quality on the left, view and session
+        /// controls on the right.
+        fn session_bar(
+            &self,
+            s: Option<&remote::RemoteStatus>,
+            fullscreen: bool,
+            cx: &mut Context<Self>,
+        ) -> gpui::Div {
+            let bar = div()
+                .h(px(BAR_PX))
+                .flex_none()
+                .pl_3()
+                .pr_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_sm()
+                .bg(rgb(ui::color::BAR))
+                .border_b_1()
+                .border_color(rgb(0x262a32));
+            let Some(s) = s else {
+                // Loopback rigs: just the measurements.
+                return bar.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(rgb(ui::color::TEXT2))
+                        .child(self.status.clone()),
+                );
             };
+
+            // The left side gives way first: a viewer fitted to a narrow window must still
+            // reach the controls.
+            let mut left = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .overflow_hidden()
+                .child(ui::dot(
+                    if s.connected {
+                        ui::color::GREEN
+                    } else {
+                        ui::color::AMBER
+                    },
+                    8.0,
+                ))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(ui::color::TEXT))
+                        .child(self.session_target.1.clone()),
+                );
+            if s.connected {
+                let rtt_color = match s.rtt_ms {
+                    Some(ms) if ms < 40.0 => ui::color::GREEN,
+                    Some(ms) if ms < 100.0 => ui::color::AMBER,
+                    Some(_) => ui::color::RED,
+                    None => ui::color::MUTED,
+                };
+                let vsep = || div().w(px(1.0)).h(px(11.0)).bg(rgb(ui::color::BORDER2));
+                let mut pill = div()
+                    .id("stats")
+                    .h(px(24.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .rounded_full()
+                    .bg(rgb(ui::color::WELL))
+                    .border_1()
+                    .border_color(rgb(ui::color::BORDER))
+                    .text_xs()
+                    .whitespace_nowrap()
+                    .text_color(rgb(ui::color::TEXT2))
+                    .tooltip(ui::tooltip(self.status.clone(), None))
+                    .child(ui::icon("signal", 13.0, rtt_color));
+                if let Some(ms) = s.rtt_ms {
+                    pill = pill
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(rtt_color))
+                                .child(format!("{ms:.0} ms")),
+                        )
+                        .child(vsep());
+                }
+                pill = pill
+                    .child(format!("{:.0} fps", s.fps))
+                    .child(vsep())
+                    .child(format!("{:.1} Mbit/s", f64::from(s.kbps) / 1000.0));
+                left = left.child(pill);
+            } else {
+                left = left.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(ui::color::MUTED))
+                        .child(self.status.clone()),
+                );
+            }
+
+            let mut right = div().flex_none().flex().items_center().gap_1();
+            if s.connected {
+                let on_monitors = s.window.is_none();
+                if s.monitors.len() > 1 {
+                    let mut seg = div()
+                        .flex()
+                        .items_center()
+                        .p(px(2.0))
+                        .gap(px(2.0))
+                        .rounded(px(7.0))
+                        .bg(rgb(ui::color::WELL))
+                        .border_1()
+                        .border_color(rgb(ui::color::BORDER))
+                        .child(div().px(px(5.0)).child(ui::icon(
+                            "monitor",
+                            13.0,
+                            ui::color::MUTED,
+                        )));
+                    for (i, m) in s.monitors.iter().take(9).enumerate() {
+                        let id = m.id;
+                        let selected = on_monitors && !s.all_monitors && s.current == Some(id);
+                        seg = seg.child(
+                            Self::seg_item(("mon", i), selected)
+                                .tooltip(ui::tooltip(
+                                    format!("Display {}", i + 1),
+                                    Some(format!("Ctrl Alt {}", i + 1).into()),
+                                ))
+                                .on_click(cx.listener(move |this, _, _, _| this.select_monitor(id)))
+                                .child(format!("{}", i + 1)),
+                        );
+                    }
+                    let all = on_monitors && s.all_monitors;
+                    seg = seg.child(
+                        Self::seg_item(("mon", 99usize), all)
+                            .tooltip(ui::tooltip("All displays", Some("Ctrl Alt 0".into())))
+                            .on_click(cx.listener(|this, _, _, _| {
+                                this.picker_open = false;
+                                this.shared.select_all();
+                            }))
+                            .child(ui::icon(
+                                "layout-grid",
+                                13.0,
+                                if all { 0xffffff } else { ui::color::TEXT2 },
+                            )),
+                    );
+                    right = right.child(seg);
+                } else if !on_monitors {
+                    right = right.child(
+                        ui::icon_button(("mon", 98usize), "monitor", 16.0, false)
+                            .tooltip(ui::tooltip("Show the desktop", None))
+                            .on_click(cx.listener(|this, _, _, _| this.show_desktop())),
+                    );
+                }
+                if s.windows_supported {
+                    let label = s
+                        .window
+                        .as_ref()
+                        .filter(|_| !s.window_closed)
+                        .map_or_else(|| "Window".to_string(), |w| process_label(&w.process));
+                    let active = !on_monitors || self.picker_open;
+                    right = right.child(div().w(px(4.0))).child(
+                        ui::button(
+                            ("mon", 97usize),
+                            Some("app-window"),
+                            label,
+                            if active {
+                                ui::Kind::Selected
+                            } else {
+                                ui::Kind::Ghost
+                            },
+                        )
+                        .max_w(px(190.0))
+                        .px(px(8.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .tooltip(ui::tooltip("Show one window", Some("Ctrl Alt W".into())))
+                        .on_click(cx.listener(|this, _, _, _| this.toggle_picker()))
+                        .child(ui::icon(
+                            "chevron-down",
+                            13.0,
+                            ui::color::ACCENT_SOFT,
+                        )),
+                    );
+                }
+                right = right.child(ui::separator());
+                if s.window.is_some() {
+                    right = right.child(
+                        ui::icon_button(
+                            ("bar", 2usize),
+                            "scaling",
+                            16.0,
+                            self.config.match_window_size,
+                        )
+                        .tooltip(ui::tooltip(
+                            if self.config.match_window_size {
+                                "Match window size: on"
+                            } else {
+                                "Match window size: off"
+                            },
+                            None,
+                        ))
+                        .on_click(cx.listener(|this, _, _, _| this.toggle_match_size())),
+                    );
+                }
+            }
+            right = right
+                .child(
+                    ui::icon_button(
+                        ("bar", 0usize),
+                        if fullscreen { "minimize" } else { "maximize" },
+                        16.0,
+                        false,
+                    )
+                    .tooltip(ui::tooltip(
+                        if fullscreen {
+                            "Exit fullscreen"
+                        } else {
+                            "Fullscreen"
+                        },
+                        Some("Ctrl Alt F".into()),
+                    ))
+                    .on_click(|_, window, _| window.toggle_fullscreen()),
+                )
+                .child(ui::separator())
+                .child(
+                    ui::button(
+                        ("bar", 1usize),
+                        Some("power"),
+                        "Disconnect",
+                        ui::Kind::Danger,
+                    )
+                    .tooltip(ui::tooltip("End the session", Some("Ctrl Alt D".into())))
+                    .on_click(cx.listener(|this, _, _, _| this.disconnect())),
+                );
+            bar.child(left).child(right)
+        }
+
+        /// One button in the bar's display switcher.
+        fn seg_item(id: (&'static str, usize), selected: bool) -> gpui::Stateful<gpui::Div> {
             div()
                 .id(id)
-                .px_2()
-                .py(px(2.0))
-                .rounded_md()
-                .flex_none()
-                .whitespace_nowrap()
-                .bg(rgb(bg))
-                .text_color(rgb(fg))
+                .h(px(24.0))
+                .min_w(px(28.0))
+                .px(px(7.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.0))
                 .cursor_pointer()
-                .hover(move |s| {
-                    if selected {
-                        s
-                    } else {
-                        s.bg(rgb(0x2a2f3a)).text_color(rgb(0xffffff))
-                    }
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(selected, |d| {
+                    d.bg(rgb(ui::color::RAISE)).text_color(rgb(0xffffff))
                 })
-                .on_click(on_click)
-                .child(label)
-                .into_any_element()
+                .when(!selected, |d| {
+                    d.text_color(rgb(ui::color::TEXT2))
+                        .hover(|s| s.bg(rgb(0x1d2027)))
+                })
         }
 
         fn track_pointer(&mut self, event: &MouseMoveEvent, _: &mut Window, _: &mut Context<Self>) {
             self.pointer_y = f32::from(event.position.y);
         }
+    }
 
-        fn section(title: &'static str) -> gpui::Div {
-            div()
-                .mt_4()
-                .mb_1()
-                .px_3()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(0x8a909c))
-                .child(title)
+    /// Case-insensitive substring search over a host's names; an empty query matches all.
+    fn query_matches(query: &str, fields: &[&str]) -> bool {
+        if query.is_empty() {
+            return true;
         }
+        let q = query.to_lowercase();
+        fields.iter().any(|f| f.to_lowercase().contains(&q))
+    }
 
-        fn render_home(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-            let (peers, disc_error, loaded) = self
-                .discovery
-                .lock()
-                .map(|d| (d.peers.clone(), d.error.clone(), d.ever_loaded))
-                .unwrap_or_default();
-            let fav_rows: Vec<_> = self
-                .config
-                .favourites
-                .clone()
-                .into_iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let online = peers
-                        .iter()
-                        .find(|p| p.target == s.target)
-                        .map(|p| p.online);
-                    self.host_row(("fav", i), &s.target, s.name, s.target.clone(), online, cx)
-                })
-                .collect();
-            let recent_rows: Vec<_> = self
-                .config
-                .recents
-                .clone()
-                .into_iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let online = peers
-                        .iter()
-                        .find(|p| p.target == s.target)
-                        .map(|p| p.online);
-                    self.host_row(
-                        ("recent", i),
-                        &s.target,
-                        s.name,
-                        s.target.clone(),
-                        online,
-                        cx,
-                    )
-                })
-                .collect();
-            let peer_rows: Vec<_> = peers
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let detail = format!(
-                        "{}  ·  {}  ·  {}",
-                        p.dns_name,
-                        p.target,
-                        if p.online { &p.os } else { "offline" }
-                    );
-                    self.host_row(
-                        ("peer", i),
-                        &p.target,
-                        p.name.clone(),
-                        detail,
-                        Some(p.online),
-                        cx,
-                    )
-                })
-                .collect();
-
-            let address_box = self.text_box(
-                "address",
-                Field::Address,
-                "MagicDNS name or Tailscale IP, then Enter",
-                cx,
-            );
-            let pin_box = self.text_box("pin", Field::Pin, "PIN", cx);
-            let settings = self.settings_row(cx);
-            let mut column = div()
-                .flex()
-                .flex_col()
-                .w(px(640.0))
-                .max_w_full()
-                .child(
-                    div()
-                        .mb_3()
-                        .text_xl()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(0xf0f0f0))
-                        .child("PeetConnect"),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(div().flex_1().child(address_box))
-                        .child(div().w(px(150.0)).child(pin_box)),
-                )
-                .child(settings);
-            if let Some(err) = &self.last_error {
-                column = column.child(
-                    div()
-                        .mt_2()
-                        .px_3()
-                        .text_sm()
-                        .text_color(rgb(0xff7b72))
-                        .child(err.clone()),
-                );
-            }
-            if !fav_rows.is_empty() {
-                column = column.child(Self::section("FAVOURITES")).children(fav_rows);
-            }
-            if !recent_rows.is_empty() {
-                column = column.child(Self::section("RECENT")).children(recent_rows);
-            }
-            column = column.child(Self::section("TAILNET"));
-            if let Some(err) = disc_error {
-                column = column.child(div().px_3().text_sm().text_color(rgb(0xff7b72)).child(err));
-            } else if !loaded {
-                column = column.child(
-                    div()
-                        .px_3()
-                        .text_sm()
-                        .text_color(rgb(0x8a909c))
-                        .child("looking for devices"),
-                );
-            } else if peer_rows.is_empty() {
-                column = column.child(
-                    div()
-                        .px_3()
-                        .text_sm()
-                        .text_color(rgb(0x8a909c))
-                        .child("no other devices on the tailnet"),
-                );
-            } else {
-                column = column.children(peer_rows);
-            }
-
-            column = column.child(
-                div()
-                    .mt_6()
-                    .px_3()
-                    .text_xs()
-                    .text_color(rgb(0x5c6370))
-                    .child(
-                        "In a session: Ctrl+Alt+1..9 one monitor  ·  Ctrl+Alt+0 all monitors  ·  \
-                         Ctrl+Alt+W one window  ·  Ctrl+Alt+F fullscreen  ·  Ctrl+Alt+D \
-                         disconnect  ·  clipboard text syncs both ways",
-                    ),
-            );
-
-            div()
-                .id("home")
-                .size_full()
-                .overflow_y_scroll()
-                .bg(rgb(0x14161a))
-                .flex()
-                .justify_center()
-                .py_8()
-                .px_4()
-                .child(column)
-                .into_any_element()
+    /// "Notepad" from "Notepad.exe": a short name for the window button.
+    fn process_label(process: &str) -> String {
+        let stem = process
+            .rsplit_once('.')
+            .filter(|(_, ext)| ext.eq_ignore_ascii_case("exe"))
+            .map_or(process, |(stem, _)| stem);
+        if stem.is_empty() {
+            "Window".into()
+        } else {
+            short_title(stem, 18)
         }
     }
 
@@ -1703,6 +2966,7 @@ mod app {
                 self.poll_session_end();
                 if self.screen == Screen::Session {
                     self.sync_clipboard(window, cx);
+                    self.adopt_host_name();
                 }
             }
             self.update_status();
@@ -1737,7 +3001,7 @@ mod app {
                 .on_mouse_move(cx.listener(Self::track_pointer));
 
             if self.mode == Mode::Remote && self.screen == Screen::Home {
-                return root.child(self.render_home(cx));
+                return root.child(self.render_home(window, cx));
             }
 
             let in_session = self.mode == Mode::Remote;
@@ -1790,92 +3054,7 @@ mod app {
             // Fullscreen hides the bar once connected; it comes back near the top edge.
             let show_bar =
                 !in_session || !fullscreen || !connected || self.pointer_y < REVEAL_BAR_PX;
-            let mut bar = div()
-                .h(px(BAR_PX))
-                .px_2()
-                .flex()
-                .items_center()
-                .gap_1()
-                .text_sm()
-                .bg(rgb(0x101010))
-                // The status gives way to the chips: a viewer fitted to a narrow window must
-                // still reach them.
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(self.status.clone()),
-                );
-            if let Some(s) = &session_status {
-                let on_monitors = s.window.is_none();
-                if s.connected && s.monitors.len() > 1 {
-                    for (i, m) in s.monitors.iter().take(9).enumerate() {
-                        let id = m.id;
-                        bar = bar.child(Self::chip(
-                            ("mon", i),
-                            format!("{}", i + 1),
-                            on_monitors && !s.all_monitors && s.current == Some(id),
-                            cx.listener(move |this, _, _, _| this.select_monitor(id)),
-                        ));
-                    }
-                    bar = bar.child(Self::chip(
-                        ("mon", 99),
-                        "all".into(),
-                        on_monitors && s.all_monitors,
-                        cx.listener(|this, _, _, _| {
-                            this.picker_open = false;
-                            this.shared.select_all();
-                        }),
-                    ));
-                } else if s.connected && !on_monitors {
-                    bar = bar.child(Self::chip(
-                        ("mon", 98),
-                        "desktop".into(),
-                        false,
-                        cx.listener(|this, _, _, _| this.show_desktop()),
-                    ));
-                }
-                if s.connected && s.windows_supported {
-                    // No title here: the status and the viewer's own title already show it,
-                    // and the bar has to fit a viewer fitted to a narrow window.
-                    bar = bar.child(Self::chip(
-                        ("mon", 97),
-                        "window ▾".into(),
-                        !on_monitors || self.picker_open,
-                        cx.listener(|this, _, _, _| this.toggle_picker()),
-                    ));
-                }
-                if s.connected && s.window.is_some() {
-                    bar = bar.child(Self::chip(
-                        ("mon", 96),
-                        "match size".into(),
-                        self.config.match_window_size,
-                        cx.listener(|this, _, _, _| this.toggle_match_size()),
-                    ));
-                }
-                if s.connected && (s.monitors.len() > 1 || s.windows_supported) {
-                    bar = bar.child(div().w(px(8.0)));
-                }
-                bar = bar
-                    .child(Self::chip(
-                        ("bar", 0),
-                        if fullscreen {
-                            "exit fullscreen"
-                        } else {
-                            "fullscreen"
-                        }
-                        .into(),
-                        false,
-                        |_, window, _| window.toggle_fullscreen(),
-                    ))
-                    .child(Self::chip(
-                        ("bar", 1),
-                        "disconnect".into(),
-                        false,
-                        cx.listener(|this, _, _, _| this.disconnect()),
-                    ));
-            }
+            let bar = self.session_bar(session_status.as_ref(), fullscreen, cx);
             // While (re)connecting, a card over the (frozen or empty) video says so and offers
             // a way out.
             let overlay = session_status.clone().filter(|s| !s.connected).map(|s| {
@@ -1892,33 +3071,12 @@ mod app {
                     .items_center()
                     .justify_center()
                     .bg(rgba(0x0000_0099))
-                    .child(
-                        div()
-                            .px_6()
-                            .py_4()
-                            .rounded_lg()
-                            .bg(rgb(0x1c2028))
-                            .border_1()
-                            .border_color(rgb(0x343a46))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xf0f0f0))
-                                    .child(heading),
-                            )
-                            .child(div().text_sm().text_color(rgb(0x8a909c)).child(s.message))
-                            .child(Self::chip(
-                                ("overlay", 0),
-                                "cancel".into(),
-                                false,
-                                cx.listener(|this, _, _, _| this.disconnect()),
-                            )),
-                    )
+                    .child(Self::overlay_card(heading, s.message).child(Self::chip(
+                        ("overlay", 0),
+                        "Cancel".into(),
+                        false,
+                        cx.listener(|this, _, _, _| this.disconnect()),
+                    )))
             });
             let window_card = session_status
                 .as_ref()
