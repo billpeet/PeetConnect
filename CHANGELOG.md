@@ -5,6 +5,8 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.4.0 - 2026-11-15
+
 ### Added
 
 - The viewer's home screen shows saved computers (pinned first, then recent) as cards with a
