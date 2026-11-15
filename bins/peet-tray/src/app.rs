@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use peet_control::{HostMode, HostStatus, Notice, Request};
+use peet_update::{Scope, Status};
 use tokio::sync::mpsc::UnboundedSender;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -37,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::host;
 use crate::link::{self, Shared};
+use crate::update;
 
 /// Notification-area callback message.
 const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -60,6 +62,9 @@ const CMD_CONFIG: usize = 5;
 const CMD_LOG: usize = 6;
 const CMD_AUTOSTART: usize = 7;
 const CMD_QUIT: usize = 8;
+const CMD_UPDATE_NOW: usize = 9;
+const CMD_UPDATE_CHECK: usize = 10;
+const CMD_UPDATE_AUTO: usize = 11;
 const SESSION_BASE: usize = 100;
 
 /// Icon resources embedded by build.rs.
@@ -113,6 +118,8 @@ struct App {
     child: Option<Child>,
     /// Session IDs behind the session menu items of the menu currently shown.
     menu_sessions: Vec<u64>,
+    /// The updater, for an installed copy: its install scope and command channel.
+    updater: Option<(Scope, std::sync::mpsc::Sender<update::Command>)>,
 }
 
 thread_local! {
@@ -219,7 +226,7 @@ pub fn run(start_host: bool) -> Result<()> {
 
     let shared = Arc::new(Mutex::new(Shared::default()));
     let hwnd_raw = hwnd.0 as isize;
-    let requests = link::spawn(shared.clone(), move || {
+    let wake = move || {
         // SAFETY: posting to our own window; a stale handle at shutdown just fails.
         let _ = unsafe {
             PostMessageW(
@@ -229,8 +236,19 @@ pub fn run(start_host: bool) -> Result<()> {
                 LPARAM(0),
             )
         };
-    })
-    .context("starting the control link")?;
+    };
+    let requests = link::spawn(shared.clone(), wake).context("starting the control link")?;
+    let updater = update::spawn(shared.clone(), wake);
+    if let Some(previous) = update::take_upgrade() {
+        shared
+            .lock()
+            .expect("shared poisoned")
+            .update_notices
+            .push((
+                format!("PeetConnect updated to {VERSION}"),
+                format!("Updated from {previous}."),
+            ));
+    }
 
     let app = App {
         hwnd,
@@ -241,9 +259,11 @@ pub fn run(start_host: bool) -> Result<()> {
         taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
         child: None,
         menu_sessions: Vec::new(),
+        updater,
     };
     app.add_icon();
     app.refresh();
+    app.show_notices();
     APP.with(|slot| *slot.borrow_mut() = Some(app));
     if start_host {
         // SAFETY: timer on our own window.
@@ -290,6 +310,10 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESU
             let handled = with_app(|app| {
                 app.refresh();
                 app.show_notices();
+                if app.shared.lock().expect("shared poisoned").quit {
+                    // SAFETY: ends the message loop; cleanup happens after it returns.
+                    unsafe { PostQuitMessage(0) };
+                }
             });
             if handled.is_none() {
                 // Busy further up the stack; try again shortly.
@@ -433,11 +457,25 @@ impl App {
     }
 
     fn show_notices(&self) {
-        let notices = std::mem::take(&mut self.shared.lock().expect("shared poisoned").notices);
-        let Some((title, text)) = notice_text(&notices) else {
-            return;
+        let (notices, update_notices) = {
+            let mut shared = self.shared.lock().expect("shared poisoned");
+            (
+                std::mem::take(&mut shared.notices),
+                std::mem::take(&mut shared.update_notices),
+            )
         };
-        self.balloon(&title, &text);
+        // One balloon at a time is all Windows shows; viewer notices matter more.
+        if let Some((title, text)) = notice_text(&notices) {
+            self.balloon(&title, &text);
+        } else if let Some((title, text)) = update_notices.last() {
+            self.balloon(title, text);
+        }
+    }
+
+    fn update_command(&self, command: update::Command) {
+        if let Some((_, tx)) = &self.updater {
+            let _ = tx.send(command);
+        }
     }
 
     fn balloon(&self, title: &str, text: &str) {
@@ -560,6 +598,34 @@ impl App {
             CMD_AUTOSTART,
             "Start with Windows",
         )?;
+        if let Some((scope, _)) = &self.updater {
+            let update = self.shared.lock().expect("shared poisoned").update.clone();
+            separator()?;
+            if let Some(line) = update_line(&update) {
+                item(MF_STRING | MF_GRAYED, 0, &line)?;
+            }
+            match &update {
+                Status::Ready { version, .. } => {
+                    item(
+                        MF_STRING,
+                        CMD_UPDATE_NOW,
+                        &format!("Install PeetConnect {version} now"),
+                    )?;
+                }
+                Status::Downloading { .. } | Status::Installing { .. } => {}
+                _ if *scope == Scope::User => {
+                    item(MF_STRING, CMD_UPDATE_CHECK, "Check for updates")?;
+                }
+                _ => {}
+            }
+            if *scope == Scope::User {
+                item(
+                    check(update::auto_install()),
+                    CMD_UPDATE_AUTO,
+                    "Install updates automatically",
+                )?;
+            }
+        }
         separator()?;
         item(
             MF_STRING,
@@ -625,6 +691,15 @@ impl App {
                 // SAFETY: ends the message loop; cleanup happens after it returns.
                 unsafe { PostQuitMessage(0) };
             }
+            CMD_UPDATE_NOW => self.update_command(update::Command::InstallNow),
+            CMD_UPDATE_CHECK => self.update_command(update::Command::CheckNow),
+            CMD_UPDATE_AUTO => {
+                if let Err(err) = update::set_auto_install(!update::auto_install()) {
+                    self.balloon("Could not change the update setting", &format!("{err:#}"));
+                }
+                // Let the updater act on the new setting now rather than at its next poll.
+                self.update_command(update::Command::Recheck);
+            }
             id if id >= SESSION_BASE => {
                 if let Some(&session) = self.menu_sessions.get(id - SESSION_BASE) {
                     self.request(Request::Disconnect { session });
@@ -686,6 +761,37 @@ fn state_line(s: &HostStatus) -> String {
     } else {
         let pin = if s.pin_required { ", PIN required" } else { "" };
         format!("Accepting viewers on port {port}{pin}")
+    }
+}
+
+/// The updater's state as a menu line, when there is something to say.
+fn update_line(status: &Status) -> Option<String> {
+    match status {
+        Status::Unknown | Status::UpToDate { .. } => None,
+        Status::Downloading { version } => Some(format!("Downloading PeetConnect {version}…")),
+        Status::Ready {
+            version,
+            automatic: true,
+            waiting_for,
+            ..
+        } if !waiting_for.is_empty() => Some(format!(
+            "PeetConnect {version} installs when {} closes",
+            waiting_for.join(" and ")
+        )),
+        Status::Ready {
+            version,
+            automatic: true,
+            ..
+        } => Some(format!("PeetConnect {version} installs shortly")),
+        Status::Ready { version, .. } => Some(format!("PeetConnect {version} is ready to install")),
+        Status::Installing { version } => Some(format!("Installing PeetConnect {version}…")),
+        Status::Failed { message, .. } => {
+            let mut line = format!("Update failed: {message}");
+            if line.chars().count() > 80 {
+                line = line.chars().take(79).collect::<String>() + "…";
+            }
+            Some(line)
+        }
     }
 }
 

@@ -11,6 +11,8 @@ rust-version.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 peet-control.workspace = true
+peet-update.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]

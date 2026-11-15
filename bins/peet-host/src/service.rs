@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 use anyhow::{Context, Result};
@@ -203,8 +203,13 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Whether the updater installs by itself (`[update] automatic` in host.toml). `service_main`
+/// is called by the SCM, so the setting reaches it through here.
+static AUTO_UPDATE: AtomicBool = AtomicBool::new(true);
+
 /// Enters the SCM dispatcher. Blocks until the service stops.
-pub fn run_service() -> Result<()> {
+pub fn run_service(auto_update: bool) -> Result<()> {
+    AUTO_UPDATE.store(auto_update, Ordering::SeqCst);
     let mut name = to_wide(SERVICE_NAME);
     let table = [
         SERVICE_TABLE_ENTRYW {
@@ -247,6 +252,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         SERVICE_RUNNING,
         SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE,
     );
+    crate::update::after_start(launch_tray);
+    crate::update::spawn(AUTO_UPDATE.load(Ordering::SeqCst));
 
     if let Err(err) = service_loop(&tx, &rx) {
         tracing::error!(%err, "service loop failed");
@@ -290,7 +297,7 @@ fn spawn_worker_for_active_session(cmdline: &[u16]) -> Option<Worker> {
         tracing::warn!("no active console session; worker not started");
         return None;
     }
-    match spawn_worker(session, cmdline) {
+    match spawn_in_session(session, cmdline, true) {
         Ok(worker) => Some(worker),
         Err(err) => {
             tracing::warn!(%err, session, "failed to spawn session worker");
@@ -306,6 +313,15 @@ struct Worker {
 }
 
 impl Worker {
+    /// Lets the process run on and closes our handles to it.
+    fn close(self) {
+        // SAFETY: owned handles, closed once.
+        unsafe {
+            let _ = CloseHandle(self.thread);
+            let _ = CloseHandle(self.process);
+        }
+    }
+
     fn terminate(self) {
         // SAFETY: owned handles; TerminateProcess is best-effort.
         unsafe {
@@ -331,8 +347,17 @@ impl Worker {
     }
 }
 
-/// Launches the worker as SYSTEM in the given session on the default interactive desktop.
-fn spawn_worker(session: u32, cmdline: &[u16]) -> Result<Worker> {
+/// Starts `peet-tray.exe` as the signed-in user of `session`, after an update closed it.
+fn launch_tray(session: u32, tray: &std::path::Path) -> Result<()> {
+    let cmdline = to_wide(&quote(&tray.to_string_lossy()));
+    spawn_in_session(session, &cmdline, false)?.close();
+    Ok(())
+}
+
+/// Launches a process in the given session on the default interactive desktop, as the
+/// session's user, or (with `system_fallback`, for the worker) as SYSTEM when nobody is signed
+/// in.
+fn spawn_in_session(session: u32, cmdline: &[u16], system_fallback: bool) -> Result<Worker> {
     // SAFETY: a sequence of Win32 calls; every handle opened is closed on all paths.
     unsafe {
         // Prefer the console user's token so the worker inherits the right profile/session; fall
@@ -340,8 +365,10 @@ fn spawn_worker(session: u32, cmdline: &[u16]) -> Result<Worker> {
         let mut user_token = HANDLE::default();
         let token = if WTSQueryUserToken(session, &mut user_token).is_ok() {
             user_token
-        } else {
+        } else if system_fallback {
             duplicate_system_token(session)?
+        } else {
+            anyhow::bail!("nobody is signed in to session {session}");
         };
 
         let mut env: *mut c_void = std::ptr::null_mut();

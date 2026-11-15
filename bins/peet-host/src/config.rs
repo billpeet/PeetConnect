@@ -18,6 +18,9 @@
 //! fps = 60
 //! max_bitrate_kbps = 12000
 //! capture = "auto"   # auto | dxgi | wgc | gdi
+//!
+//! [update]
+//! automatic = true    # the service installs updates by itself (per-machine installs)
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,6 +44,8 @@ pub struct FileConfig {
     pub allow: AllowConfig,
     #[serde(skip_serializing_if = "is_default")]
     pub video: VideoConfig,
+    #[serde(skip_serializing_if = "is_default")]
+    pub update: UpdateConfig,
 }
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
@@ -95,6 +100,16 @@ pub struct VideoConfig {
     pub window_capture: Option<String>,
 }
 
+/// Updates of a per-machine install, which the service applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Install a downloaded update by itself once nothing is in use (the default). When false
+    /// it waits for `peet update` or the tray's "Install now".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic: Option<bool>,
+}
+
 impl FileConfig {
     /// The settings given as command-line flags, for writing into a new file.
     pub fn from_cli(cli: &crate::Cli) -> Self {
@@ -118,6 +133,7 @@ impl FileConfig {
                 window_popups: None,
                 window_capture: None,
             },
+            update: UpdateConfig::default(),
         }
     }
 
@@ -148,6 +164,9 @@ const TEMPLATE_HEADER: &str = "\
 # wake_display = true     # wake the displays and keep them on while a viewer is connected
 # window_popups = true    # window streams include the app's menus and other popups
 # window_capture = \"auto\" # auto | crop (cut windows out of the monitor capture)
+#
+# [update]                # per-machine installs, updated by the service
+# automatic = true        # false: download, but wait for `peet update` to install
 ";
 
 /// The default file: per-user for a console host, machine-wide for the service and its worker.
@@ -202,6 +221,8 @@ pub struct HostConfig {
     /// True when running as the service worker: capture and input threads follow the active
     /// input desktop so they keep working across the secure desktop.
     pub follow_desktop: bool,
+    /// The service installs downloaded updates by itself.
+    pub auto_update: bool,
 }
 
 impl HostConfig {
@@ -241,6 +262,7 @@ impl HostConfig {
             window_popups: file.video.window_popups.unwrap_or(true),
             window_crop: file.video.window_capture.as_deref() == Some("crop"),
             follow_desktop: cli.session_worker,
+            auto_update: file.update.automatic.unwrap_or(true),
         }
     }
 

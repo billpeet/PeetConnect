@@ -18,6 +18,12 @@ pub struct Shared {
     pub status: Option<HostStatus>,
     /// Notices not yet shown.
     pub notices: Vec<Notice>,
+    /// The updater's state (written by the updater thread).
+    pub update: peet_update::Status,
+    /// Updater notifications not yet shown: title and text.
+    pub update_notices: Vec<(String, String)>,
+    /// Set by the updater when the tray should quit for an install.
+    pub quit: bool,
 }
 
 /// Starts the link thread. `wake` is called (from that thread) after every change.

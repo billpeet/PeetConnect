@@ -113,7 +113,7 @@ Every release carries `latest.json` and `latest.json.sig`:
 | --- | --- | --- |
 | Checks | the tray, 2 minutes after start and then every 6 h with jitter | the service, on the same schedule |
 | Installs | the tray launches the installer detached with `/CURRENTUSER`, then exits | the service launches the installer as SYSTEM, detached and outside the service's job, with `/ALLUSERS` |
-| Shows | tray menu "Update available / Installing…", balloon "Updated to 0.2.0" | the tray shows the service's update state, read over the control pipe (new `HostStatus.update` field) |
+| Shows | tray menu "Update available / Installing…", balloon "Updated to 0.2.0" | the tray shows the service's update state from `%ProgramData%\PeetConnect\update.json`, and quits when it says `installing`; the restarted service starts it again |
 
 `peet update` (CLI) checks and installs on demand, and `peet update --check` only reports.
 
@@ -128,7 +128,7 @@ shows a notification naming what blocks the update, usually an agent's MCP serve
 "Install now", which closes those processes.
 
 With notify-only switched on, the update is downloaded and verified, then waits for the user to
-click "Restart to update" in the tray.
+click "Install now" in the tray. For a per-machine install that is `[update] automatic = false` in host.toml, and "Install now" runs the installer with an administrator prompt.
 
 ### Failure handling
 
@@ -143,8 +143,8 @@ click "Restart to update" in the tray.
 A new `crates/peet-update` crate handles the manifest fetch, signature and version check,
 download into staging, hash check and the idle policy. It also launches the installer. The tray,
 the service worker loop (`peet-host`) and the CLI call into it. For HTTPS it uses `ureq` with
-rustls/ring, or WinHTTP through `windows` if that keeps binaries smaller; this is decided at
-implementation.
+rustls/ring, or WinHTTP through `windows` if that keeps binaries smaller. Decided: WinHTTP (system
+TLS, certificates and proxy, nothing added to the binaries), with `ring` for the signature and hash.
 
 ## Versioning and releases
 
