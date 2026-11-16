@@ -180,3 +180,31 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
             .context("removing the Run key")
     }
 }
+
+/// Whether the PeetConnect service is installed and not stopped. Its SYSTEM worker is then the
+/// host, so the tray must not start a console one: that would take the port first and leave
+/// viewers with a host that cannot reach elevated windows or the secure desktop.
+pub fn service_active() -> bool {
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+        SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOPPED,
+    };
+    // SAFETY: plain SCM queries; every handle opened is closed.
+    unsafe {
+        let Ok(manager) = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) else {
+            return false;
+        };
+        let active = match OpenServiceW(manager, w!("PeetConnect"), SERVICE_QUERY_STATUS) {
+            Ok(service) => {
+                let mut status = SERVICE_STATUS::default();
+                let running = QueryServiceStatus(service, &mut status).is_ok()
+                    && status.dwCurrentState != SERVICE_STOPPED;
+                let _ = CloseServiceHandle(service);
+                running
+            }
+            Err(_) => false,
+        };
+        let _ = CloseServiceHandle(manager);
+        active
+    }
+}

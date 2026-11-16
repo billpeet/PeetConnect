@@ -139,13 +139,15 @@ than a `\n` in `peet_type`.
 ### Tray app
 
 `peet-tray` sits in the notification area of the host machine. Launched, it starts a console host
-(windowless, logging to `%LOCALAPPDATA%\PeetConnect\host.log`) unless one is already running;
-`--no-host` only watches. The icon shows the state: red when accepting, a green dot while someone
-is viewing, an amber pause badge while paused, grey when no host is running. Its menu lists
-connected viewers (click one to disconnect it; the viewer is told and does not reconnect), and has
-Pause new connections, Start/Stop/Restart host, Open configuration (creates a commented
-`host.toml` if there is none), Open host log, Start with Windows (a per-user Run key) and Quit,
-which also stops a host the tray started. Windows notifications announce viewers connecting,
+(windowless, logging to `%LOCALAPPDATA%\PeetConnect\host.log`) unless one is already running or
+the PeetConnect service is (its worker is the host then); `--no-host` only watches. A console host
+runs as you, without elevation, so Windows stops its input from reaching programs running as
+administrator; use the service for those. The icon shows the state: red when accepting, a green
+dot while someone is viewing, an amber pause badge while paused, grey when no host is running.
+Its menu lists connected viewers (click one to disconnect it; the viewer is told and does not
+reconnect), and has Pause new connections, Start/Stop/Restart host, Open configuration (creates a
+commented `host.toml` if there is none), Open host log, Start with Windows (a per-user Run key)
+and Quit, which also stops a host the tray started. Windows notifications announce viewers connecting,
 leaving, and connections refused.
 
 The tray reads allow rules from `%APPDATA%\PeetConnect\host.toml`, not from flags, so set at
@@ -155,8 +157,9 @@ same control pipe, and the tray shows "(service)" and offers no Stop.
 ### Unattended access (Windows service)
 
 For a machine you want to reach when nobody is signed in, install the host as a service. It runs
-as LocalSystem and launches a worker into the active console session, which is what lets it
-capture and inject across sign-in, the lock screen and UAC prompts.
+as LocalSystem and launches a worker, also as LocalSystem, into the active console session, which
+is what lets it capture and inject across sign-in, the lock screen, UAC prompts and programs
+running as administrator.
 
 ```
 scripts\install-service.ps1 -AllowUser you@example.com      # installs and starts (prompts for admin)

@@ -5,8 +5,9 @@
 //! everything at sign-in. It talks to the host over the local control pipe (`peet-control`),
 //! so it works the same whether the host is a console process or the service's worker.
 //!
-//! Launching the tray starts a console host when none is running after a short grace period
-//! (the service's worker may still be starting); `--no-host` only watches.
+//! Launching the tray starts a console host when none is running after a short grace period,
+//! unless the PeetConnect service is running (its worker is the host then); `--no-host` only
+//! watches.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
