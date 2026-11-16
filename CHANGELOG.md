@@ -5,6 +5,14 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+### Fixed
+
+- The unattended-access service still could not control the screen in 0.4.2: its worker
+  attached to the desktop without the access right Windows requires for `SendInput`, so every
+  mouse and keyboard event was refused. Waking sleeping displays failed the same way.
+- A host that cannot inject input now says so in its log, with the Windows error, instead of
+  dropping the events silently.
+
 ## 0.4.2 - 2026-11-16
 
 ### Fixed

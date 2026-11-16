@@ -178,6 +178,7 @@ fn send(events: &[INPUT]) -> Result<(), InputError> {
         Err(InputError::Partial {
             delivered,
             expected,
+            reason: std::io::Error::last_os_error(),
         })
     }
 }
