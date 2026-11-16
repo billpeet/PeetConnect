@@ -156,10 +156,11 @@ mod app {
     use anyhow::{Context as _, Result};
     use gpui::{
         canvas, deferred, div, img, prelude::*, px, rgb, rgba, size, App, Application, Bounds,
-        ClickEvent, ClipboardItem, Context, FocusHandle, FontWeight, ImageSource, KeyDownEvent,
-        Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-        ObjectFit, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
-        TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
+        ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, FontWeight, ImageSource,
+        KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        NavigationDirection, ObjectFit, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent,
+        SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
+        WindowOptions,
     };
     use peet_capture::windows::Backend;
     use peet_proto::{MonitorId, RejectReason};
@@ -229,6 +230,11 @@ mod app {
     const RESIZE_SETTLE: Duration = Duration::from_millis(400);
     /// Video-area changes this soon after the viewer resized itself are its own doing.
     const SELF_RESIZE_GRACE: Duration = Duration::from_millis(700);
+    /// How long after the viewer's last pointer move a host cursor move still counts as an
+    /// echo of it. A move later than that came from the host side (its own mouse, or an app
+    /// warping the pointer), so the cursor is drawn where the host says until the viewer
+    /// moves again.
+    const CURSOR_ECHO_GRACE: Duration = Duration::from_millis(300);
 
     /// Settings a session is started with.
     #[derive(Debug, Clone)]
@@ -391,6 +397,9 @@ mod app {
         title: String,
         /// Pointer y in the window, to reveal the bar in fullscreen.
         pointer_y: f32,
+        /// When the pointer last moved over the video, so the remote cursor can follow the
+        /// local pointer without waiting for the host's echo.
+        local_moved_at: Option<Instant>,
         /// The host window list is open under the bar.
         picker_open: bool,
         /// Window-size matching (see [`ViewerConfig::match_window_size`]).
@@ -450,6 +459,7 @@ mod app {
                 session_target: (String::new(), String::new()),
                 title: String::new(),
                 pointer_y: 0.0,
+                local_moved_at: None,
                 picker_open: false,
                 size_sync: SizeSync::default(),
                 last_error: None,
@@ -1061,6 +1071,7 @@ mod app {
             _: &mut Context<Self>,
         ) {
             if let Some((x, y)) = self.window_to_host(event.position, window) {
+                self.local_moved_at = Some(Instant::now());
                 self.shared
                     .send_input(peet_proto::InputEvent::MouseMove { x, y });
             }
@@ -1121,9 +1132,15 @@ mod app {
             Some((vx.round() as i32, vy.round() as i32))
         }
 
-        /// The remote cursor as an absolutely positioned image over the video, placed through
-        /// the tile of the monitor it is on.
-        fn cursor_element(&self, window: &mut Window) -> Option<gpui::AnyElement> {
+        /// The remote cursor (its shape, as the host reports it) as an absolutely positioned
+        /// image over the video. With `follow_local` it sits at the local pointer while the
+        /// viewer is the one moving it, so it moves without the round trip to the host;
+        /// otherwise, and whenever the host moved it on its own, it sits where the host says.
+        fn cursor_element(
+            &self,
+            window: &mut Window,
+            follow_local: bool,
+        ) -> Option<gpui::AnyElement> {
             let mut cursor = self.shared.cursor.lock().ok()?;
             if let Some(retired) = cursor.retired.take() {
                 drop(cursor);
@@ -1136,20 +1153,58 @@ mod app {
             }
             let shape = cursor.shape.clone()?;
             let tiles = self.shared.tiles();
-            let tile = tiles.iter().find(|t| {
-                let b = t.bounds;
-                cursor.x >= b.x
-                    && cursor.y >= b.y
-                    && i64::from(cursor.x) < i64::from(b.x) + i64::from(b.width)
-                    && i64::from(cursor.y) < i64::from(b.y) + i64::from(b.height)
-            })?;
-            let scale =
-                f64::from(tile.rect.right - tile.rect.left) / f64::from(tile.bounds.width.max(1));
-            let local_x = f64::from(cursor.x - tile.bounds.x) - f64::from(cursor.hotspot.0);
-            let local_y = f64::from(cursor.y - tile.bounds.y) - f64::from(cursor.hotspot.1);
             let device_scale = f64::from(window.scale_factor());
-            let left = (f64::from(tile.rect.left) + local_x * scale) / device_scale;
-            let top = (f64::from(tile.rect.top) + local_y * scale) / device_scale;
+            let tile_scale = |t: &crate::present::Tile| {
+                f64::from(t.rect.right - t.rect.left) / f64::from(t.bounds.width.max(1))
+            };
+            let viewer_drives = match (self.local_moved_at, cursor.moved_at) {
+                (Some(local), Some(remote)) => remote <= local + CURSOR_ECHO_GRACE,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            // The hotspot in device pixels relative to the window's client area, and the tile
+            // it is drawn through.
+            let local = if follow_local && viewer_drives {
+                let pos = window.mouse_position();
+                let x = f64::from(f32::from(pos.x)) * device_scale;
+                let y = f64::from(f32::from(pos.y)) * device_scale;
+                tiles
+                    .iter()
+                    .find(|t| {
+                        x >= f64::from(t.rect.left)
+                            && x < f64::from(t.rect.right)
+                            && y >= f64::from(t.rect.top)
+                            && y < f64::from(t.rect.bottom)
+                    })
+                    .map(|t| (t, x, y))
+            } else {
+                None
+            };
+            let (tile, hot_x, hot_y) = if let Some(hit) = local {
+                hit
+            } else {
+                let tile = tiles.iter().find(|t| {
+                    let b = t.bounds;
+                    cursor.x >= b.x
+                        && cursor.y >= b.y
+                        && i64::from(cursor.x) < i64::from(b.x) + i64::from(b.width)
+                        && i64::from(cursor.y) < i64::from(b.y) + i64::from(b.height)
+                })?;
+                let scale = tile_scale(tile);
+                (
+                    tile,
+                    f64::from(tile.rect.left) + f64::from(cursor.x - tile.bounds.x) * scale,
+                    f64::from(tile.rect.top) + f64::from(cursor.y - tile.bounds.y) * scale,
+                )
+            };
+            let scale = tile_scale(tile);
+            // Tiles are relative to the client area, but this element is positioned inside
+            // the video area, which starts below the session bar.
+            let origin = self.placement.lock().map(|p| *p).unwrap_or_default();
+            let left =
+                (hot_x - f64::from(cursor.hotspot.0) * scale - f64::from(origin.x)) / device_scale;
+            let top =
+                (hot_y - f64::from(cursor.hotspot.1) * scale - f64::from(origin.y)) / device_scale;
             let width = f64::from(cursor.size.0) * scale / device_scale;
             let height = f64::from(cursor.size.1) * scale / device_scale;
             Some(
@@ -3035,11 +3090,6 @@ mod app {
                     .into_any_element()
                 }
             };
-            let cursor = if in_session {
-                self.cursor_element(window)
-            } else {
-                None
-            };
 
             // In composition modes the video area must stay unpainted so the visual
             // underneath shows through; only the status bar gets a background.
@@ -3086,6 +3136,26 @@ mod app {
                 .as_ref()
                 .filter(|s| s.connected && self.picker_open && s.windows_supported)
                 .map(|s| Self::window_picker(s, cx));
+            // The pointer belongs to the remote desktop unless a card or menu is over the video:
+            // then the local arrow stays, for the card's buttons.
+            let follow_local =
+                connected && overlay.is_none() && window_card.is_none() && picker.is_none();
+            let cursor = if in_session {
+                self.cursor_element(window, follow_local)
+            } else {
+                None
+            };
+            // The remote cursor stands in for the local one over the video, so hide the local
+            // one there; two pointers, one a round trip behind the other, look broken.
+            let content = if follow_local && cursor.is_some() {
+                div()
+                    .size_full()
+                    .cursor(CursorStyle::None)
+                    .child(content)
+                    .into_any_element()
+            } else {
+                content
+            };
             let root = if show_bar { root.child(bar) } else { root };
             root.child({
                 let mut area = div().flex_1().min_h_0().relative();

@@ -91,6 +91,8 @@ pub struct CursorOverlay {
     pub x: i32,
     pub y: i32,
     pub visible: bool,
+    /// When the host last reported a new position.
+    pub moved_at: Option<Instant>,
     pub shape: Option<Arc<RenderImage>>,
     pub size: (u32, u32),
     pub hotspot: (u32, u32),
@@ -560,6 +562,9 @@ async fn session(
                     }
                     Event::Cursor(update) => {
                         let mut cursor = shared.cursor.lock().expect("cursor poisoned");
+                        if (cursor.x, cursor.y) != (update.x, update.y) {
+                            cursor.moved_at = Some(Instant::now());
+                        }
                         cursor.x = update.x;
                         cursor.y = update.y;
                         cursor.visible = update.visible;

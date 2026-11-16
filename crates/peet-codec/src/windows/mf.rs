@@ -34,6 +34,7 @@ use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHR
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 
 use super::convert::GpuConverter;
+use super::Step;
 use crate::nv12::bgra_to_nv12;
 use crate::{contains_idr, CodecError, EncodedPacket, EncoderConfig, VideoEncoder};
 
@@ -296,7 +297,8 @@ impl MfH264Encoder {
         let nv12 = path.converter.convert(texture, 0)?;
         // SAFETY: nv12 is a live texture on the device the encoder is bound to.
         let sample = unsafe {
-            let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nv12, 0, false)?;
+            let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nv12, 0, false)
+                .step("MFCreateDXGISurfaceBuffer")?;
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
             sample
@@ -317,7 +319,9 @@ impl MfH264Encoder {
 
             if let Some(events) = self.events.clone() {
                 while self.need_input_credits == 0 {
-                    let event = events.GetEvent(MF_EVENT_FLAG_NONE)?;
+                    let event = events
+                        .GetEvent(MF_EVENT_FLAG_NONE)
+                        .step("waiting for METransformNeedInput")?;
                     self.handle_event(&event, &mut packets)?;
                 }
                 self.need_input_credits -= 1;
@@ -329,104 +333,175 @@ impl MfH264Encoder {
                 }
                 self.force_keyframe = false;
             }
-            self.transform.ProcessInput(self.input_id, sample, 0)?;
+            self.transform
+                .ProcessInput(self.input_id, sample, 0)
+                .step("ProcessInput")?;
 
             if let Some(events) = self.events.clone() {
                 // Collect anything already queued, then block once so that a 1-in-1-out
                 // encoder returns this frame's output in this call.
-                self.drain_events(&events, &mut packets)?;
-                if packets.is_empty() {
-                    let event = events.GetEvent(MF_EVENT_FLAG_NONE)?;
-                    self.handle_event(&event, &mut packets)?;
-                    self.drain_events(&events, &mut packets)?;
+                let mut format_changed = self.drain_events(&events, &mut packets)?;
+                if packets.is_empty() && !format_changed {
+                    let event = events
+                        .GetEvent(MF_EVENT_FLAG_NONE)
+                        .step("waiting for encoder output")?;
+                    format_changed |= self.handle_event(&event, &mut packets)?;
+                    format_changed |= self.drain_events(&events, &mut packets)?;
+                }
+                if packets.is_empty() && format_changed {
+                    self.await_output_after_format_change(&events, &mut packets)?;
                 }
             } else {
-                while self.process_output(&mut packets)? {}
+                while self.process_output(&mut packets)? != Output::NeedMoreInput {}
             }
         }
         Ok(packets)
     }
 
+    /// Handles every queued event without blocking. True if an output turned into a format
+    /// change (see [`handle_event`](Self::handle_event)).
     unsafe fn drain_events(
         &mut self,
         events: &IMFMediaEventGenerator,
         packets: &mut Vec<EncodedPacket>,
-    ) -> Result<(), CodecError> {
+    ) -> Result<bool, CodecError> {
+        let mut format_changed = false;
         loop {
             // SAFETY: caller guarantees the generator is live.
             match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(event) => self.handle_event(&event, packets)?,
-                Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(()),
-                Err(err) => return Err(err.into()),
+                Ok(event) => format_changed |= self.handle_event(&event, packets)?,
+                Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(format_changed),
+                Err(err) => return Err(err).step("GetEvent"),
             }
         }
     }
 
-    fn handle_event(
+    /// After a format change an async encoder re-announces this frame's output with another
+    /// `METransformHaveOutput`. Wait briefly for it rather than block: should it never come,
+    /// the next frame's event handling picks up whatever follows.
+    unsafe fn await_output_after_format_change(
         &mut self,
-        event: &IMFMediaEvent,
+        events: &IMFMediaEventGenerator,
         packets: &mut Vec<EncodedPacket>,
     ) -> Result<(), CodecError> {
-        // SAFETY: event is live.
-        let kind = unsafe { event.GetType() }?;
-        if kind == METransformNeedInput.0.cast_unsigned() {
-            self.need_input_credits += 1;
-        } else if kind == METransformHaveOutput.0.cast_unsigned() {
-            self.process_output(packets)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while packets.is_empty() && std::time::Instant::now() < deadline {
+            // SAFETY: caller guarantees the generator is live.
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => {
+                    self.handle_event(&event, packets)?;
+                }
+                Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(err) => return Err(err).step("GetEvent"),
+            }
         }
         Ok(())
     }
 
-    /// Pulls one output sample. Returns `Ok(false)` when the encoder needs more input.
-    fn process_output(&mut self, packets: &mut Vec<EncodedPacket>) -> Result<bool, CodecError> {
-        loop {
-            let provided = if self.provides_samples {
-                None
-            } else {
-                // SAFETY: allocating a sample with a buffer of the advertised size.
-                Some(unsafe {
-                    let sample = MFCreateSample()?;
-                    let buffer = MFCreateMemoryBuffer(self.output_size.max(1))?;
-                    sample.AddBuffer(&buffer)?;
-                    sample
-                })
-            };
-            let mut out = MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: self.output_id,
-                pSample: ManuallyDrop::new(provided),
-                dwStatus: 0,
-                pEvents: ManuallyDrop::new(None),
-            };
-            let mut status = 0u32;
-            // SAFETY: `out` is valid for the call; ownership of its fields is taken below.
-            let result = unsafe {
-                self.transform
-                    .ProcessOutput(0, std::slice::from_mut(&mut out), &mut status)
-            };
-            // SAFETY: we own both ManuallyDrop fields and take them exactly once.
-            let sample = unsafe {
-                ManuallyDrop::drop(&mut out.pEvents);
-                ManuallyDrop::take(&mut out.pSample)
-            };
-            match result {
-                Ok(()) => {
-                    if let Some(sample) = sample {
-                        packets.push(packet_from_sample(&sample)?);
-                    }
-                    return Ok(true);
+    /// Acts on one async encoder event. True when a `METransformHaveOutput` turned into a
+    /// format change: the encoder then announces the actual output with another one.
+    fn handle_event(
+        &mut self,
+        event: &IMFMediaEvent,
+        packets: &mut Vec<EncodedPacket>,
+    ) -> Result<bool, CodecError> {
+        // SAFETY: event is live.
+        let kind = unsafe { event.GetType() }?;
+        // SAFETY: event is live. A failure the async MFT hit on its own thread arrives as an
+        // event whose status is the error (METransformError / MEError, or a failed HaveOutput).
+        let status = unsafe { event.GetStatus() }.step("encoder event status")?;
+        if status.is_err() {
+            return Err(CodecError::Os {
+                code: status.0,
+                message: format!(
+                    "encoder event {kind} failed: {}",
+                    windows::core::Error::from(status).message()
+                ),
+            });
+        }
+        if kind == METransformNeedInput.0.cast_unsigned() {
+            self.need_input_credits += 1;
+        } else if kind == METransformHaveOutput.0.cast_unsigned() {
+            // One ProcessOutput per METransformHaveOutput: an async MFT answers a call it did
+            // not announce with E_UNEXPECTED (Intel Quick Sync does; NVENC lets it pass).
+            return Ok(self.process_output(packets)? == Output::FormatChanged);
+        }
+        Ok(false)
+    }
+
+    /// Makes one `ProcessOutput` call, appending the sample it yields to `packets`.
+    fn process_output(&mut self, packets: &mut Vec<EncodedPacket>) -> Result<Output, CodecError> {
+        let provided = if self.provides_samples {
+            None
+        } else {
+            // SAFETY: allocating a sample with a buffer of the advertised size.
+            Some(unsafe {
+                let sample = MFCreateSample()?;
+                let buffer = MFCreateMemoryBuffer(self.output_size.max(1))?;
+                sample.AddBuffer(&buffer)?;
+                sample
+            })
+        };
+        let mut out = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: self.output_id,
+            pSample: ManuallyDrop::new(provided),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        };
+        let mut status = 0u32;
+        // SAFETY: `out` is valid for the call; ownership of its fields is taken below.
+        let result = unsafe {
+            self.transform
+                .ProcessOutput(0, std::slice::from_mut(&mut out), &mut status)
+        };
+        // SAFETY: we own both ManuallyDrop fields and take them exactly once.
+        let sample = unsafe {
+            ManuallyDrop::drop(&mut out.pEvents);
+            ManuallyDrop::take(&mut out.pSample)
+        };
+        match result {
+            Ok(()) => {
+                if let Some(sample) = sample {
+                    packets.push(packet_from_sample(&sample)?);
                 }
-                Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(false),
-                Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    // SAFETY: renegotiate with the type the transform now prefers.
-                    unsafe {
-                        let new_type = self.transform.GetOutputAvailableType(self.output_id, 0)?;
-                        self.transform.SetOutputType(self.output_id, &new_type, 0)?;
-                    }
-                }
-                Err(err) => return Err(err.into()),
+                Ok(Output::Sample)
             }
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(Output::NeedMoreInput),
+            Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                // SAFETY: renegotiate with the type the transform now prefers.
+                unsafe {
+                    let new_type = self
+                        .transform
+                        .GetOutputAvailableType(self.output_id, 0)
+                        .step("GetOutputAvailableType after stream change")?;
+                    self.transform
+                        .SetOutputType(self.output_id, &new_type, 0)
+                        .step("SetOutputType after stream change")?;
+                    let info = self
+                        .transform
+                        .GetOutputStreamInfo(self.output_id)
+                        .step("GetOutputStreamInfo after stream change")?;
+                    self.provides_samples =
+                        info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0.cast_unsigned() != 0;
+                    self.output_size = info.cbSize;
+                }
+                tracing::debug!(name = %self.name, "encoder output type renegotiated");
+                Ok(Output::FormatChanged)
+            }
+            Err(err) => Err(err).step("ProcessOutput"),
         }
     }
+}
+
+/// What one `ProcessOutput` call produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Output {
+    Sample,
+    NeedMoreInput,
+    /// The output type changed and was renegotiated; no sample this time.
+    FormatChanged,
 }
 
 // SAFETY: Media Foundation transforms and D3D11 objects are free-threaded COM objects
@@ -594,7 +669,9 @@ unsafe fn find_input_type(
 fn packet_from_sample(sample: &IMFSample) -> Result<EncodedPacket, CodecError> {
     // SAFETY: Lock/Unlock are paired and the slice is only read while locked.
     unsafe {
-        let buffer = sample.ConvertToContiguousBuffer()?;
+        let buffer = sample
+            .ConvertToContiguousBuffer()
+            .step("ConvertToContiguousBuffer")?;
         let mut ptr = std::ptr::null_mut::<u8>();
         let mut len = 0u32;
         buffer.Lock(&mut ptr, None, Some(&mut len))?;

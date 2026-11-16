@@ -5,6 +5,18 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.4.1 - 2026-11-16
+
+### Fixed
+
+- Hosts with Intel graphics sent no video: the viewer opened a see-through window and the
+  host logged `os error 0x8000ffff: Catastrophic failure`. The Intel Quick Sync encoder
+  renegotiates its output on the first frame, and the host now waits for it to do so.
+- The viewer showed two cursors during a session: the local one, and the host's drawn one
+  session-bar height too low. The local cursor is now hidden over the video and the host's
+  cursor (with its shape, such as a hand over links) follows the mouse without lag.
+- Encoder errors in the host log now name the call that failed.
+
 ## 0.4.0 - 2026-11-15
 
 ### Added
