@@ -457,11 +457,24 @@ async fn inject_input_stream(mut recv: FramedRecv, session_id: SessionId, follow
             .flatten();
         let mut injector = peet_input::Injector::new();
         let mut count: u64 = 0;
+        let mut failed: u64 = 0;
         while let Ok(event) = rx.recv() {
             if let Err(err) = injector.inject(&event) {
-                tracing::debug!(session = session_id.0, %err, "input injection failed");
+                // Say so once per stream: a host that sees but cannot control is otherwise silent.
+                if failed == 0 {
+                    tracing::warn!(session = session_id.0, %err, "input injection failed");
+                }
+                failed += 1;
             }
             count += 1;
+        }
+        if failed > 0 {
+            tracing::warn!(
+                session = session_id.0,
+                failed,
+                count,
+                "input events not injected"
+            );
         }
         count
     });

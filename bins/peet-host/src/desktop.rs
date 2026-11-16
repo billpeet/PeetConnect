@@ -9,10 +9,12 @@
 
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
-    DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS, HDESK,
+    DESKTOP_JOURNALPLAYBACK, DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS, HDESK,
 };
 
-/// Moves the calling thread onto the current input desktop. Returns the desktop handle, which
+/// Moves the calling thread onto the current input desktop. The handle carries
+/// `DESKTOP_JOURNALPLAYBACK`, without which `SendInput` from the thread fails with access denied.
+/// Returns the desktop handle, which
 /// the caller keeps alive for as long as the thread should stay attached, or `None` if the
 /// desktop could not be opened (for the secure desktop this needs the SYSTEM account).
 pub fn attach_input_desktop() -> Option<DesktopGuard> {
@@ -21,7 +23,9 @@ pub fn attach_input_desktop() -> Option<DesktopGuard> {
         OpenInputDesktop(
             DESKTOP_CONTROL_FLAGS(0),
             false,
-            DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0),
+            DESKTOP_ACCESS_FLAGS(
+                DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0 | DESKTOP_JOURNALPLAYBACK.0,
+            ),
         )
     };
     let Ok(handle) = handle else {

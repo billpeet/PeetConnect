@@ -334,7 +334,7 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESU
             // SAFETY: our own timer.
             let _ = unsafe { KillTimer(Some(hwnd), TIMER_AUTOSTART) };
             with_app(|app| {
-                if app.status().is_none() {
+                if app.status().is_none() && !host::service_active() {
                     app.start_host();
                 }
             });

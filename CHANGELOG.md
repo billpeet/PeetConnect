@@ -5,6 +5,29 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.4.3 - 2026-11-16
+
+### Fixed
+
+- The unattended-access service still could not control the screen in 0.4.2: its worker
+  attached to the desktop without the access right Windows requires for `SendInput`, so every
+  mouse and keyboard event was refused. Waking sleeping displays failed the same way.
+- A host that cannot inject input now says so in its log, with the Windows error, instead of
+  dropping the events silently.
+
+## 0.4.2 - 2026-11-16
+
+### Fixed
+
+- With the unattended-access service installed, viewers could see the screen but not control
+  it. The service started its worker as the signed-in user, which could not read the service's
+  configuration and exited at once, and the service did not notice the first worker ending, so
+  it never started another. The tray then started an ordinary host, whose input Windows blocks
+  from reaching programs running as administrator. The worker now runs as SYSTEM, the service
+  restarts it whenever it ends (waiting longer each time if it keeps failing) and logs why it
+  stopped, and the tray leaves the hosting to the service.
+- Locking or unlocking the host no longer restarts the service's worker and drops viewers.
+
 ## 0.4.1 - 2026-11-16
 
 ### Fixed

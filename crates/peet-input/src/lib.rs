@@ -10,8 +10,12 @@ use peet_proto::InputEvent;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
-    #[error("SendInput delivered {delivered} of {expected} events")]
-    Partial { delivered: u32, expected: u32 },
+    #[error("SendInput delivered {delivered} of {expected} events: {reason}")]
+    Partial {
+        delivered: u32,
+        expected: u32,
+        reason: std::io::Error,
+    },
     #[error("input injection is only implemented on Windows")]
     Unsupported,
 }
