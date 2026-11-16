@@ -5,6 +5,8 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.4.1 - 2026-11-16
+
 ### Fixed
 
 - Hosts with Intel graphics sent no video: the viewer opened a see-through window and the
