@@ -27,6 +27,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 
+use super::Step;
 use crate::CodecError;
 
 /// Number of owned output textures rotated through by [`GpuConverter::convert`], so a
@@ -262,12 +263,14 @@ impl GpuConverter {
         let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
         // SAFETY: descriptors are valid; the stream's view is released manually afterwards.
         unsafe {
-            self.video_device.CreateVideoProcessorInputView(
-                source,
-                &self.enumerator,
-                &in_desc,
-                Some(&mut in_view),
-            )?;
+            self.video_device
+                .CreateVideoProcessorInputView(
+                    source,
+                    &self.enumerator,
+                    &in_desc,
+                    Some(&mut in_view),
+                )
+                .step("CreateVideoProcessorInputView")?;
             let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
                 OutputIndex: 0,
@@ -288,7 +291,7 @@ impl GpuConverter {
                 std::slice::from_ref(&stream),
             );
             ManuallyDrop::drop(&mut stream.pInputSurface);
-            result?;
+            result.step("VideoProcessorBlt")?;
         }
         Ok(())
     }
