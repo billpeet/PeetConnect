@@ -5,6 +5,8 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.4.2 - 2026-11-16
+
 ### Fixed
 
 - With the unattended-access service installed, viewers could see the screen but not control
