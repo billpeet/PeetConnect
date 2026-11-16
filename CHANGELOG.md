@@ -5,6 +5,8 @@ User-visible changes per release. Add notes under "Unreleased" as you go;
 
 ## Unreleased
 
+## 0.4.3 - 2026-11-16
+
 ### Fixed
 
 - The unattended-access service still could not control the screen in 0.4.2: its worker
